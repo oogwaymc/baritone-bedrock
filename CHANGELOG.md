@@ -2,6 +2,15 @@
 
 All notable changes to Baritone Bedrock. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.2.1
+
+Supports Minecraft Bedrock 26.52 (package 1.26.5203.0), like 1.2.0.
+
+### Fixed
+
+- **Injecting over a copy that is already loaded.** Injecting this DLL while another Baritone Bedrock (an older version such as the French 1.1.0, or the same file a second time) was still in the game put two bots on the same game functions, which can crash Minecraft. Every version creates the same unload event, so a second copy now notices it already exists, asks the first copy to unload (the same clean unload as the dev tool's), waits for it to be gone (it is recognised by the `BaritoneBedrock.pdb` path in its debug directory, whatever the file is called), and only then installs its hooks. If the old copy doesn't unload within 30 seconds, the new one doesn't start and says so in `log.txt`.
+- `log.txt` now starts with the version number.
+
 ## 1.2.0
 
 Supports Minecraft Bedrock 26.52 (package 1.26.5203.0), like 1.1.0.

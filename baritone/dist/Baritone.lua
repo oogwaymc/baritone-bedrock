@@ -25,11 +25,14 @@ description = "Baritone-style pathfinding bot. Type #help in chat. Needs Bariton
 author = "Bedrock Baritone"
 debug = false
 
-local VERSION = "1.1.0"
+local VERSION = "1.2.0"
 local DIR = "Baritone"
 -- true inside Baritone.dll: input, rotation, inventory and rendering are native
 local NATIVE = type(rawget(_G, "native")) == "table" and type(native.setInput) == "function"
 local Bot = {}          -- filled in later (forward declaration)
+
+-- lots of small short-lived tables: generational GC avoids long pauses (frame hitches)
+if NATIVE then pcall(collectgarbage, "generational") end
 
 -- =====================================================================
 -- Utilities
@@ -49,9 +52,25 @@ function U.now()
     return os.clock() * 1000
 end
 
--- "minecraft:Stone[foo=bar]" -> "stone"
+-- diagnostics shared by the main loop and #debug
+local DBG = { tickSource = "game", realTickT = nil, frames = 0 }
+
+-- "minecraft:Stone[foo=bar]" -> "stone"  (memoized: block names repeat constantly)
+local BARE, BARE_N = {}, 0
 function U.bare(n)
     if n == nil then return "air" end
+    local hit = BARE[n]
+    if hit then return hit end
+    local orig = n
+    n = U.bareRaw(n)
+    if BARE_N < 50000 then
+        BARE[orig] = n
+        BARE_N = BARE_N + 1
+    end
+    return n
+end
+
+function U.bareRaw(n)
     n = tostring(n)
     local b = n:find("[", 1, true)
     if b then n = n:sub(1, b - 1) end
@@ -294,7 +313,10 @@ defSetting("maxPathNodes", "int", 30000, "Max nodes explored per path search")
 defSetting("autoTool", "bool", true, "Switch to the best tool in the hotbar when breaking")
 defSetting("sprintMinHunger", "int", 7, "Do not sprint below this hunger")
 defSetting("rotationSpeed", "float", 540, "Max camera turn speed (degrees per second)")
-defSetting("rotationMode", "string", "set", "DLL only: 'set' writes the rotation directly, 'turn' uses the game's mouse-look (needs #calibrate)")
+defSetting("rotationMode", "string", "set",
+    "DLL only: 'set' writes the rotation directly, 'turn' uses the game's mouse-look, 'mouse' moves the real mouse ('turn' and 'mouse' need #calibrate)")
+defSetting("inputMode", "string", "auto",
+    "DLL only: 'hook' writes the game's movement input, 'keys' presses your movement keys, 'auto' starts with hook and switches to keys if you don't move")
 defSetting("walkPitch", "float", 12, "Camera pitch while walking")
 
 -- Rendering
@@ -330,7 +352,10 @@ defSetting("buildIgnoreMissingItems", "bool", false, "Skip blocks you have no it
 defSetting("buildReach", "float", 4.5, "Reach used for placing and breaking")
 defSetting("litematicaRender", "bool", true, "Draw the loaded schematic as ghost blocks")
 defSetting("litematicaRenderRadius", "int", 10, "Ghost block render radius")
-defSetting("litematicaMaxBoxes", "int", 250, "Max ghost boxes drawn per frame")
+defSetting("litematicaMaxBoxes", "int", 200, "Max ghost boxes drawn per frame")
+defSetting("litematicaFill", "bool", true, "Tint ghost blocks with the colour of the block that goes there")
+defSetting("litematicaShowLooking", "bool", true, "Show which schematic block you're looking at on the HUD")
+defSetting("litematicaScanPerFrame", "int", 150, "Schematic blocks re-checked per frame (higher = quicker updates, more lag)")
 
 -- Elytra
 defSetting("elytraCruiseHeight", "int", 40, "Cruise altitude above takeoff point / terrain")
@@ -770,6 +795,96 @@ function K.javaToBedrock(jn)
     if endsWith(n, "_wall_head") or endsWith(n, "_head") or endsWith(n, "_skull") then return "skull" end
     if n:sub(1, 7) == "potted_" then return "flower_pot" end
     return n
+end
+
+-- =====================================================================
+-- Block colours for ghost blocks (roughly the block's texture colour)
+-- =====================================================================
+K.COLOR_EXACT = {
+    stone = { 125, 125, 125 }, cobblestone = { 110, 110, 110 }, mossy_cobblestone = { 100, 120, 90 },
+    smooth_stone = { 160, 160, 160 }, stone_bricks = { 120, 120, 120 }, granite = { 150, 100, 80 },
+    diorite = { 200, 200, 200 }, andesite = { 135, 135, 135 }, calcite = { 225, 225, 220 }, tuff = { 110, 110, 100 },
+    deepslate = { 75, 75, 80 }, cobbled_deepslate = { 75, 75, 80 }, dirt = { 135, 95, 65 }, grass_block = { 95, 160, 60 },
+    grass = { 95, 160, 60 }, coarse_dirt = { 120, 85, 60 }, podzol = { 95, 65, 30 }, mycelium = { 115, 95, 115 },
+    mud = { 60, 55, 60 }, packed_mud = { 140, 105, 80 }, mud_bricks = { 140, 105, 80 }, clay = { 160, 165, 180 },
+    gravel = { 130, 125, 120 }, sand = { 220, 210, 160 }, red_sand = { 190, 100, 35 }, sandstone = { 215, 205, 155 },
+    red_sandstone = { 185, 100, 35 }, glass = { 200, 230, 240 }, ice = { 145, 185, 250 }, packed_ice = { 140, 180, 250 },
+    blue_ice = { 115, 165, 250 }, snow = { 245, 250, 250 }, snow_layer = { 245, 250, 250 }, obsidian = { 25, 15, 40 },
+    crying_obsidian = { 45, 10, 80 }, bedrock = { 60, 60, 60 }, netherrack = { 110, 50, 50 }, soul_sand = { 80, 60, 50 },
+    soul_soil = { 75, 57, 45 }, glowstone = { 250, 205, 120 }, sea_lantern = { 200, 225, 220 }, end_stone = { 220, 220, 160 },
+    purpur_block = { 170, 125, 170 }, prismarine = { 100, 160, 145 }, dark_prismarine = { 50, 90, 75 },
+    prismarine_bricks = { 100, 170, 160 }, quartz_block = { 235, 230, 225 }, smooth_quartz = { 235, 230, 225 },
+    brick_block = { 150, 95, 80 }, bricks = { 150, 95, 80 }, nether_brick = { 45, 22, 27 }, red_nether_brick = { 70, 10, 10 },
+    blackstone = { 40, 35, 40 }, basalt = { 80, 80, 85 }, polished_basalt = { 90, 90, 95 }, hay_block = { 200, 170, 40 },
+    bookshelf = { 140, 110, 70 }, crafting_table = { 140, 100, 60 }, furnace = { 110, 110, 110 }, chest = { 160, 115, 50 },
+    barrel = { 130, 95, 55 }, torch = { 255, 210, 90 }, lantern = { 90, 85, 80 }, ladder = { 150, 115, 65 },
+    scaffolding = { 200, 170, 90 }, slime = { 110, 190, 90 }, slime_block = { 110, 190, 90 }, honey_block = { 240, 170, 40 },
+    sponge = { 200, 190, 75 }, tnt = { 200, 60, 40 }, pumpkin = { 200, 120, 30 }, melon_block = { 115, 145, 35 },
+    iron_block = { 220, 220, 220 }, gold_block = { 245, 210, 60 }, diamond_block = { 100, 235, 225 },
+    emerald_block = { 45, 200, 90 }, lapis_block = { 30, 65, 140 }, redstone_block = { 175, 25, 15 },
+    coal_block = { 20, 20, 20 }, copper_block = { 190, 105, 80 }, netherite_block = { 65, 60, 65 },
+    amethyst_block = { 135, 95, 190 }, dripstone_block = { 135, 105, 90 }, moss_block = { 90, 110, 45 },
+    water = { 60, 100, 230 }, lava = { 230, 100, 20 }, redstone_wire = { 200, 20, 10 }, redstone_lamp = { 180, 110, 60 },
+    piston = { 150, 130, 100 }, sticky_piston = { 120, 160, 100 }, observer = { 100, 100, 100 }, hopper = { 70, 70, 75 },
+    dispenser = { 115, 115, 115 }, dropper = { 115, 115, 115 }, beacon = { 130, 220, 215 }, anvil = { 70, 70, 70 },
+    white_wool = { 235, 235, 235 }, target = { 225, 175, 160 }, note_block = { 115, 75, 55 }, jukebox = { 115, 75, 55 },
+}
+
+-- colour words used by wool, concrete, terracotta, glass, carpet, beds, candles ...
+K.COLOR_WORDS = {
+    { "light_blue", { 60, 175, 220 } }, { "light_gray", { 155, 155, 150 } }, { "silver", { 155, 155, 150 } },
+    { "white", { 235, 235, 235 } }, { "orange", { 240, 120, 20 } }, { "magenta", { 190, 70, 180 } },
+    { "yellow", { 250, 200, 40 } }, { "lime", { 115, 185, 25 } }, { "pink", { 240, 140, 170 } },
+    { "gray", { 65, 70, 75 } }, { "cyan", { 20, 140, 145 } }, { "purple", { 120, 40, 170 } },
+    { "blue", { 50, 55, 160 } }, { "brown", { 115, 70, 40 } }, { "green", { 85, 110, 25 } },
+    { "red", { 160, 40, 35 } }, { "black", { 25, 25, 30 } },
+}
+
+-- material words (checked after colour words)
+K.COLOR_MATERIALS = {
+    { "pale_oak", { 230, 220, 215 } }, { "dark_oak", { 70, 45, 20 } }, { "oak", { 165, 130, 80 } },
+    { "spruce", { 115, 85, 50 } }, { "birch", { 195, 180, 120 } }, { "jungle", { 160, 115, 80 } },
+    { "acacia", { 170, 90, 50 } }, { "mangrove", { 120, 55, 50 } }, { "cherry", { 225, 175, 170 } },
+    { "bamboo", { 195, 175, 80 } }, { "crimson", { 100, 50, 70 } }, { "warped", { 45, 105, 100 } },
+    { "deepslate", { 75, 75, 80 } }, { "blackstone", { 40, 35, 40 } }, { "cobblestone", { 110, 110, 110 } },
+    { "stone_brick", { 120, 120, 120 } }, { "mossy", { 100, 120, 90 } }, { "end_stone", { 220, 220, 160 } },
+    { "sandstone", { 215, 205, 155 } }, { "prismarine", { 100, 160, 145 } }, { "purpur", { 170, 125, 170 } },
+    { "quartz", { 235, 230, 225 } }, { "nether_brick", { 45, 22, 27 } }, { "brick", { 150, 95, 80 } },
+    { "copper", { 190, 105, 80 } }, { "oxidized", { 80, 160, 130 } }, { "weathered", { 105, 150, 110 } },
+    { "exposed", { 160, 125, 100 } }, { "tuff", { 110, 110, 100 } }, { "granite", { 150, 100, 80 } },
+    { "diorite", { 200, 200, 200 } }, { "andesite", { 135, 135, 135 } }, { "mud", { 140, 105, 80 } },
+    { "terracotta", { 150, 90, 65 } }, { "glass", { 200, 230, 240 } }, { "concrete", { 130, 130, 130 } },
+    { "wool", { 235, 235, 235 } }, { "leaves", { 60, 130, 40 } }, { "log", { 110, 85, 50 } }, { "wood", { 110, 85, 50 } },
+    { "planks", { 165, 130, 80 } }, { "ore", { 125, 125, 125 } }, { "stone", { 125, 125, 125 } },
+    { "iron", { 220, 220, 220 } }, { "gold", { 245, 210, 60 } }, { "door", { 150, 115, 70 } },
+    { "fence", { 150, 115, 70 } }, { "rail", { 150, 140, 120 } }, { "carpet", { 235, 235, 235 } },
+}
+
+K.colorCache = {}
+
+function K.blockColor(name)
+    local c = K.colorCache[name]
+    if c then return c end
+    local n = K.canon and K.canon(name) or name
+    c = K.COLOR_EXACT[name] or K.COLOR_EXACT[n]
+    if not c then
+        for _, e in ipairs(K.COLOR_WORDS) do
+            if n:find(e[1], 1, true) then c = e[2] break end
+        end
+    end
+    if not c then
+        for _, e in ipairs(K.COLOR_MATERIALS) do
+            if n:find(e[1], 1, true) then c = e[2] break end
+        end
+    end
+    if not c then
+        -- anything else: a stable colour from the name, so the same block always looks the same
+        local h = 0
+        for i = 1, #n do h = (h * 31 + n:byte(i)) % 16777216 end
+        c = { 80 + h % 160, 80 + (h // 160) % 160, 80 + (h // 25600) % 160 }
+    end
+    K.colorCache[name] = c
+    return c
 end
 
 -- =====================================================================
@@ -1521,8 +1636,14 @@ end
 
 function IN.rawPending() return #IN.rawQueue > 0 end
 
+function IN.rotMode()
+    local m = tostring(S.rotationMode):lower()
+    if m == "turn" or m == "mouse" then return m end
+    return "set"
+end
+
 function IN.turnMode()
-    return NATIVE and S.rotationMode == "turn"
+    return NATIVE and IN.rotMode() ~= "set"
 end
 
 function IN.calibrated()
@@ -1581,7 +1702,169 @@ end
 -- Native (DLL) output: movement through the game's input state, rotation
 -- written directly (or through the game's mouse-look), clicks / hotbar keys
 -- ------------------------------------------------------------------
-IN.nat = { rmbSent = 0, slotSent = 0, lastActive = false, setFails = 0, lastSetYaw = nil, lastSetPrevYaw = nil }
+IN.nat = { rmbSent = 0, slotSent = 0, lastActive = false, setFails = 0, lastSetYaw = nil, lastSetPrevYaw = nil,
+    autoMode = "hook", sentMode = nil, sentKeys = nil, syncT = -1e9, stats = nil, statsT = -1e9,
+    mv = nil, hookMoved = false, keysMoved = false, warnedStuck = false, yawWin = nil, yawBad = 0, fracX = 0, fracY = 0 }
+
+-- Windows virtual-key codes for the key settings (used by the "keys" input mode)
+IN.VK_NAMES = { SPACE = 0x20, LSHIFT = 0xA0, RSHIFT = 0xA1, SHIFT = 0x10, LCONTROL = 0xA2, LCTRL = 0xA2,
+    RCONTROL = 0xA3, RCTRL = 0xA3, CONTROL = 0x11, CTRL = 0x11, TAB = 0x09, CAPSLOCK = 0x14, CAPITAL = 0x14,
+    LALT = 0xA4, LMENU = 0xA4, RALT = 0xA5, ALT = 0x12, UP = 0x26, DOWN = 0x28, LEFT = 0x25, RIGHT = 0x27,
+    ENTER = 0x0D, RETURN = 0x0D }
+
+function IN.vk(name)
+    local s = tostring(name or ""):upper():gsub("^KEY_", ""):gsub("%s", "")
+    if #s == 1 then
+        local b = s:byte()
+        if (b >= 65 and b <= 90) or (b >= 48 and b <= 57) then return b end
+    end
+    if IN.VK_NAMES[s] then return IN.VK_NAMES[s] end
+    local f = tonumber(s:match("^F(%d+)$") or "")
+    if f and f >= 1 and f <= 24 then return 0x6F + f end
+    return nil
+end
+
+-- diagnostics from the DLL (hook ages, focus, dead signatures ...)
+function IN.stats(now)
+    local nat = IN.nat
+    now = now or U.now()
+    if now - nat.statsT >= 250 then
+        nat.statsT = now
+        local ok, st = pcall(native.stats)
+        nat.stats = (ok and type(st) == "table") and st or nil
+    end
+    return nat.stats
+end
+
+function IN.inputMode()
+    local m = tostring(S.inputMode):lower()
+    if m == "hook" or m == "keys" then return m end
+    return IN.nat.autoMode
+end
+
+-- tell the DLL which input mode and movement keys to use (when they change)
+function IN.syncNative(now, force)
+    local nat = IN.nat
+    if not force and now - nat.syncT < 250 then return end
+    nat.syncT = now
+    local mode = IN.inputMode()
+    if mode ~= nat.sentMode then
+        nat.sentMode = mode
+        pcall(native.setInputMode, mode)
+    end
+    local keys = {}
+    for i, k in ipairs({ "keyForward", "keyBack", "keyLeft", "keyRight", "keyJump", "keySneak", "keySprint" }) do
+        keys[i] = IN.vk(S[k]) or 0
+    end
+    local sig = tconcat(keys, ",")
+    if sig ~= nat.sentKeys then
+        nat.sentKeys = sig
+        pcall(native.setMoveKeys, table.unpack(keys))
+    end
+end
+
+-- 'auto' input mode: if the player doesn't move while the bot holds a
+-- movement key, the game ignored the hook - press the real keys instead
+function IN.checkMovement(now, active)
+    local nat = IN.nat
+    local h = IN.hold
+    local wants = active and (h.forward or h.back or h.left or h.right)
+    if not wants or not Helper.focus or not P.inHud() then nat.mv = nil return end
+    local mode = IN.inputMode()
+    local mv = nat.mv
+    if not mv or mv.mode ~= mode then
+        nat.mv = { t = now, x = P.x, z = P.z, mode = mode }
+        return
+    end
+    if U.dist2(P.x, P.z, mv.x, mv.z) > 0.3 then
+        if mode == "hook" then nat.hookMoved = true else nat.keysMoved = true end
+        nat.mv = { t = now, x = P.x, z = P.z, mode = mode }
+        return
+    end
+    local stuckFor = now - mv.t
+    local st = IN.stats(now)
+    local hookDead = st ~= nil and st.moveAge ~= nil and (st.moveAge < 0 or st.moveAge > 1000)
+    if tostring(S.inputMode):lower() == "auto" and mode == "hook" and not nat.hookMoved
+        and ((hookDead and stuckFor > 300) or stuckFor > 1500) then
+        nat.autoMode = "keys"
+        nat.mv = nil
+        IN.syncNative(now, true)
+        U.chat("\194\167eThe game isn't taking the bot's movement - switching to pressing your movement keys"
+            .. " (" .. tostring(S.keyForward) .. tostring(S.keyLeft) .. tostring(S.keyBack) .. tostring(S.keyRight)
+            .. ", " .. tostring(S.keyJump) .. ", " .. tostring(S.keySneak) .. ", " .. tostring(S.keySprint) .. ").")
+    elseif mode == "keys" and not nat.keysMoved and stuckFor > 4000 and not nat.warnedStuck then
+        nat.warnedStuck = true
+        U.chat("\194\167cI can't move you. Type " .. S.prefix .. "debug and send the developer what it says.")
+    end
+end
+
+function IN.switchRotation(reason)
+    local st = IN.stats()
+    local cur = IN.rotMode()
+    local nxt
+    if cur == "set" then
+        nxt = (st and st.deadTurn) and "mouse" or "turn"
+    elseif cur == "turn" then
+        nxt = "mouse"
+    else
+        return false
+    end
+    S.rotationMode = nxt
+    S.mouseYawPerPixel, S.mousePitchPerPixel = 0, 0
+    Settings.save()
+    U.chat("\194\167e" .. reason .. " - switching to " .. (nxt == "turn" and "the game's mouse-look" or "real mouse movement")
+        .. " for turning (calibrating, don't touch the mouse).")
+    IN.nat.fracX, IN.nat.fracY = 0, 0
+    if Bot.makeCalibrate then Bot.queuePre(Bot.makeCalibrate()) end
+    return true
+end
+
+-- if the bot walks forward but the player moves in a different direction from
+-- where the bot thinks it's looking, the rotation write isn't reaching the game
+function IN.checkYaw(now, active)
+    local nat = IN.nat
+    local h = IN.hold
+    if not active or not h.forward or h.back or h.left or h.right or not P.grounded or IN.rotMode() ~= "set" then
+        nat.yawWin = nil
+        return
+    end
+    local w = nat.yawWin
+    local turned = w and U.wrap180(P.yaw - w.yaw) or 0
+    if not w or abs(turned) > 30 then
+        nat.yawWin = { t = now, x = P.x, z = P.z, yaw = P.yaw }
+        return
+    end
+    if now - w.t < 350 then return end
+    local d = U.dist2(P.x, P.z, w.x, w.z)
+    if d > 0.5 then
+        local moveYaw = U.yawTo(w.x, w.z, P.x, P.z)
+        local meanYaw = w.yaw + turned / 2
+        if abs(U.wrap180(moveYaw - meanYaw)) > 50 then
+            nat.yawBad = nat.yawBad + 1
+        else
+            nat.yawBad = max(0, nat.yawBad - 1)
+        end
+        if nat.yawBad >= 4 then
+            nat.yawBad = 0
+            IN.switchRotation("You're not walking the way the bot is looking")
+        end
+    end
+    nat.yawWin = { t = now, x = P.x, z = P.z, yaw = P.yaw }
+end
+
+-- turn by a calibrated amount: the game's mouse-look ("turn") or the real mouse ("mouse")
+function IN.turnRaw(dx, dy)
+    local nat = IN.nat
+    if IN.rotMode() == "mouse" then
+        nat.fracX, nat.fracY = nat.fracX + dx, nat.fracY + dy
+        local ix = nat.fracX >= 0 and floor(nat.fracX) or ceil(nat.fracX)
+        local iy = nat.fracY >= 0 and floor(nat.fracY) or ceil(nat.fracY)
+        nat.fracX, nat.fracY = nat.fracX - ix, nat.fracY - iy
+        if ix ~= 0 or iy ~= 0 then pcall(native.mouseMove, U.clamp(ix, -400, 400), U.clamp(iy, -400, 400)) end
+    else
+        pcall(native.turn, dx, dy)
+    end
+end
 
 function IN.nativeRotate(now, dt, active)
     local nat = IN.nat
@@ -1591,12 +1874,9 @@ function IN.nativeRotate(now, dt, active)
         local wanted = abs(U.wrap180(nat.lastSetYaw - nat.lastSetPrevYaw))
         if wanted > 0.5 and moved < 0.05 then
             nat.setFails = nat.setFails + 1
-            if nat.setFails >= 20 and S.rotationMode == "set" then
-                S.rotationMode = "turn"
-                S.mouseYawPerPixel, S.mousePitchPerPixel = 0, 0
-                Settings.save()
-                U.chat("\194\167eDirect rotation doesn't work on this version - switching to mouse-look turning (calibrating).")
-                if Bot.makeCalibrate then Bot.queuePre(Bot.makeCalibrate()) end
+            if nat.setFails >= 20 and IN.rotMode() == "set" then
+                nat.setFails = 0
+                IN.switchRotation("Direct rotation doesn't work on this version")
             end
         elseif moved >= 0.05 then
             nat.setFails = 0
@@ -1615,7 +1895,7 @@ function IN.nativeRotate(now, dt, active)
     if sy == 0 and sp == 0 then return end
     if IN.turnMode() then
         if not IN.calibrated() then return end
-        pcall(native.turn, sy / S.mouseYawPerPixel, sp / S.mousePitchPerPixel)
+        IN.turnRaw(sy / S.mouseYawPerPixel, sp / S.mousePitchPerPixel)
     else
         local ny, np = U.wrap180(P.yaw + sy), U.clamp(P.pitch + sp, -89.9, 89.9)
         pcall(native.setRotation, np, ny)
@@ -1625,11 +1905,12 @@ end
 
 function IN.nativeFrame(now, dt, active)
     local nat = IN.nat
+    IN.syncNative(now)
     IN.nativeRotate(now, dt, active)
-    -- calibration moves (turn mode only)
+    -- calibration moves (turn / mouse modes)
     if #IN.rawQueue > 0 then
         local st = tremove(IN.rawQueue, 1)
-        pcall(native.turn, st[1], st[2])
+        IN.turnRaw(st[1], st[2])
     end
     if active then
         local h = IN.hold
@@ -1652,6 +1933,8 @@ function IN.nativeFrame(now, dt, active)
             pcall(native.setButtons, false, false)
         end
     end
+    IN.checkMovement(now, active)
+    IN.checkYaw(now, active)
     nat.lastActive = active
     IN.active = active
 end
@@ -2742,8 +3025,18 @@ function Proc.calibrate(announce)
                 if abs(d) < 0.5 then
                     self.tries = self.tries + 1
                     if self.tries >= 2 then
-                        if NATIVE then
-                            U.chat("\194\167cThe camera didn't move. Set #set rotationMode set and try again.")
+                        if NATIVE and IN.rotMode() == "turn" then
+                            -- the game's mouse-look didn't turn us: try real mouse movement
+                            S.rotationMode = "mouse"
+                            Settings.save()
+                            U.chat("\194\167eMouse-look didn't turn the camera - trying real mouse movement.")
+                            self.tries = 0
+                            self.phase = "wait"
+                            self.t = now
+                            return "running"
+                        elseif NATIVE then
+                            U.chat("\194\167cThe camera didn't move with any method. Type " .. S.prefix
+                                .. "debug and send the developer what it says. (" .. S.prefix .. "set rotationMode set to reset)")
                         else
                             U.chat("\194\167cThe camera didn't move. Check that BaritoneHelper.exe is running (as admin if Minecraft runs as admin) and the game window is focused.")
                         end
@@ -3793,8 +4086,13 @@ end
 -- =====================================================================
 -- Litematica-style placement of the loaded schematic
 -- =====================================================================
+-- targets: every block of the placement { x, y, z, name, key }
+-- layers[y]: the targets in that layer; buckets: targets per 16x16x16 section
+-- stat[key]: cached "ok" / "missing" / "wrong", kept fresh by a scanner that
+-- checks a few hundred blocks per frame (so big schematics don't lag the game)
 local LM = { schem = nil, ox = 0, oy = 0, oz = 0, rot = 0, mirror = nil, targets = {}, byKey = {},
-    buckets = {}, minY = 0, maxY = -1, layer = nil, ghosts = {}, ghostT = 0, loading = nil }
+    buckets = {}, layers = {}, minY = 0, maxY = -1, layer = nil, ghosts = {}, ghostT = 0, loading = nil,
+    stat = {}, cur = {}, known = 0, scanI = 1, near = {}, nearI = 1, nearT = 0, nearCell = nil, look = nil, lookT = 0 }
 
 function LM.transform(x, y, z)
     local s = LM.schem
@@ -3816,10 +4114,15 @@ end
 
 function LM.rebuild()
     local s = LM.schem
-    LM.targets, LM.byKey, LM.buckets = {}, {}, {}
+    LM.targets, LM.byKey, LM.buckets, LM.layers = {}, {}, {}, {}
+    LM.stat, LM.cur, LM.known, LM.scanI = {}, {}, 0, 1
+    LM.near, LM.nearI, LM.nearT, LM.nearCell = {}, 1, 0, nil
+    LM.ghosts, LM.ghostT, LM.look = {}, 0, nil
     if not s then return end
     local includeAir = S.buildClearAir
     local sx, sz = s.sx, s.sz
+    local minY, maxY = INF, -INF
+    local targets, byKey, layers, buckets = LM.targets, LM.byKey, LM.layers, LM.buckets
     for idx, id in pairs(s.data) do
         local name = s.pal[id]
         if name and (name ~= "air" or includeAir) then
@@ -3830,28 +4133,155 @@ function LM.rebuild()
             local wx, wy, wz = LM.transform(x, y, z)
             local k = U.key(wx, wy, wz)
             local t = { wx, wy, wz, name, k }
-            LM.targets[#LM.targets + 1] = t
-            LM.byKey[k] = name
+            targets[#targets + 1] = t
+            byKey[k] = name
+            local layer = layers[wy]
+            if not layer then layer = {} layers[wy] = layer end
+            layer[#layer + 1] = t
+            local bk = U.key(wx // 16, wy // 16, wz // 16)
+            local b = buckets[bk]
+            if not b then b = {} buckets[bk] = b end
+            b[#b + 1] = t
+            if wy < minY then minY = wy end
+            if wy > maxY then maxY = wy end
         end
     end
-    tsort(LM.targets, function(a, b)
-        if a[2] ~= b[2] then return a[2] < b[2] end
-        if a[1] ~= b[1] then return a[1] < b[1] end
-        return a[3] < b[3]
-    end)
-    LM.minY, LM.maxY = INF, -INF
-    LM.layerStart = {}
-    for i, t in ipairs(LM.targets) do
-        if t[2] < LM.minY then LM.minY = t[2] end
-        if t[2] > LM.maxY then LM.maxY = t[2] end
-        if not LM.layerStart[t[2]] then LM.layerStart[t[2]] = i end
-        local bk = U.key(t[1] // 16, 0, t[3] // 16)
-        local b = LM.buckets[bk]
-        if not b then b = {} LM.buckets[bk] = b end
-        b[#b + 1] = t
+    LM.minY, LM.maxY = minY, maxY
+end
+
+-- fresh check of one target (updates the cache)
+function LM.check(t)
+    local st, n = LM.state(t)
+    local k = t[5]
+    if LM.stat[k] == nil then LM.known = LM.known + 1 end
+    LM.stat[k] = st
+    LM.cur[k] = n
+    return st, n
+end
+
+-- cached state, checking it now if it's never been checked
+function LM.cached(t)
+    local st = LM.stat[t[5]]
+    if st then return st, LM.cur[t[5]] end
+    return LM.check(t)
+end
+
+-- targets near the player (rebuilt when the player moves a few blocks)
+function LM.refreshNear(now)
+    local r = S.litematicaRenderRadius
+    local cx, cy, cz = P.fx, P.fy, P.fz
+    local cell = U.key(cx // 3, cy // 3, cz // 3)
+    if cell == LM.nearCell and now - LM.nearT < 3000 then return end
+    LM.nearCell, LM.nearT = cell, now
+    local out = {}
+    for bx = (cx - r) // 16, (cx + r) // 16 do
+        for by = (cy - r) // 16, (cy + r) // 16 do
+            for bz = (cz - r) // 16, (cz + r) // 16 do
+                local b = LM.buckets[U.key(bx, by, bz)]
+                if b then
+                    for _, t in ipairs(b) do
+                        if abs(t[1] - cx) <= r and abs(t[3] - cz) <= r and abs(t[2] - cy) <= r then
+                            out[#out + 1] = t
+                        end
+                    end
+                end
+            end
+        end
     end
-    LM.ghosts = {}
-    LM.ghostT = 0
+    LM.near = out
+    if LM.nearI > #out then LM.nearI = 1 end
+end
+
+-- re-check a slice of the schematic every frame: mostly what's near the
+-- player (what you can see), plus a slow sweep over the rest (for #build)
+function LM.scanStep(now)
+    if not LM.schem then return end
+    LM.refreshNear(now)
+    -- the budget is per 60 FPS frame, so a high frame rate doesn't scan more per second
+    local elapsed = min(50, max(0, now - (LM.scanT or now - 16.7)))
+    LM.scanT = now
+    LM.scanCarry = (LM.scanCarry or 0) + max(20, S.litematicaScanPerFrame) * elapsed / 16.7
+    local budget = floor(LM.scanCarry)
+    LM.scanCarry = LM.scanCarry - budget
+    if budget <= 0 then return end
+    local near = LM.near
+    local nn = #near
+    local nearBudget = min(nn, floor(budget * 0.7))
+    for _ = 1, nearBudget do
+        if LM.nearI > nn then LM.nearI = 1 end
+        LM.check(near[LM.nearI])
+        LM.nearI = LM.nearI + 1
+    end
+    local all = LM.targets
+    local na = #all
+    for _ = 1, min(na, budget - nearBudget) do
+        if LM.scanI > na then LM.scanI = 1 end
+        LM.check(all[LM.scanI])
+        LM.scanI = LM.scanI + 1
+    end
+end
+
+-- block the player's crosshair is on, if it's part of the schematic
+function LM.lookAt()
+    if not LM.schem then return nil end
+    local ex, ey, ez = P.eye()
+    local yaw, pitch = P.yaw * RAD, P.pitch * RAD
+    local dx, dy, dz = -sin(yaw) * cos(pitch), -sin(pitch), cos(yaw) * cos(pitch)
+    local x, y, z = floor(ex), floor(ey), floor(ez)
+    local stepX, stepY, stepZ = dx >= 0 and 1 or -1, dy >= 0 and 1 or -1, dz >= 0 and 1 or -1
+    local function first(p, d)
+        if d == 0 then return INF end
+        local edge = (d > 0) and (floor(p) + 1) or floor(p)
+        return (edge - p) / d
+    end
+    local tMaxX, tMaxY, tMaxZ = first(ex, dx), first(ey, dy), first(ez, dz)
+    local tDX = dx ~= 0 and abs(1 / dx) or INF
+    local tDY = dy ~= 0 and abs(1 / dy) or INF
+    local tDZ = dz ~= 0 and abs(1 / dz) or INF
+    for _ = 1, 80 do
+        local k = U.key(x, y, z)
+        local want = LM.byKey[k]
+        if want and (LM.layer == nil or y == LM.layer) then
+            local t = { x, y, z, want, k }
+            local st, n = LM.cached(t)
+            if st ~= "ok" or not K.passable(n) then return t, st, n end
+        elseif not K.passable(W.get(x, y, z)) then
+            return nil
+        end
+        if tMaxX < tMaxY and tMaxX < tMaxZ then
+            if tMaxX > 24 then break end
+            x = x + stepX tMaxX = tMaxX + tDX
+        elseif tMaxY < tMaxZ then
+            if tMaxY > 24 then break end
+            y = y + stepY tMaxY = tMaxY + tDY
+        else
+            if tMaxZ > 24 then break end
+            z = z + stepZ tMaxZ = tMaxZ + tDZ
+        end
+    end
+    return nil
+end
+
+function LM.lookText(now)
+    if not LM.schem or not S.litematicaShowLooking then LM.look = nil return nil end
+    if now - LM.lookT >= 100 then
+        LM.lookT = now
+        local t, st, n = LM.lookAt()
+        if not t then
+            LM.look = nil
+        else
+            local txt
+            if st == "ok" then
+                txt = t[4] .. " (done)"
+            elseif st == "missing" then
+                txt = t[4] .. " (missing)"
+            else
+                txt = t[4] .. " (wrong: " .. tostring(n) .. " is there)"
+            end
+            LM.look = { t = t, text = txt }
+        end
+    end
+    return LM.look and LM.look.text or nil
 end
 
 function LM.set(schem, ox, oy, oz)
@@ -3863,7 +4293,7 @@ end
 
 function LM.unload()
     LM.schem = nil
-    LM.targets, LM.byKey, LM.buckets, LM.ghosts = {}, {}, {}, {}
+    LM.rebuild() -- clears everything
 end
 
 function LM.state(t)
@@ -3879,41 +4309,69 @@ function LM.state(t)
 end
 
 -- refresh the list of ghost boxes near the player (called a few times a second)
+-- ghost boxes near the player, from the cached states (no world reads here)
+-- each: { x, y, z, state, distance, blockName }
 function LM.updateGhosts(now)
-    if not LM.schem or now - LM.ghostT < 400 then return end
+    if not LM.schem then return end
+    LM.scanStep(now)
+    if now - LM.ghostT < 250 then return end
     LM.ghostT = now
-    local r = S.litematicaRenderRadius
-    local cx, cy, cz = P.fx, P.fy, P.fz
+    local cx, cy, cz = P.fx + 0.5, P.fy + 1.5, P.fz + 0.5
     local out = {}
-    local maxBoxes = S.litematicaMaxBoxes
-    local cr = r // 16 + 1
-    for bx = cx // 16 - cr, cx // 16 + cr do
-        for bz = cz // 16 - cr, cz // 16 + cr do
-            local b = LM.buckets[U.key(bx, 0, bz)]
-            if b then
-                for _, t in ipairs(b) do
-                    if (LM.layer == nil or t[2] == LM.layer) and abs(t[1] - cx) <= r and abs(t[3] - cz) <= r and abs(t[2] - cy) <= r then
-                        local st = LM.state(t)
-                        if st ~= "ok" then
-                            out[#out + 1] = { t[1], t[2], t[3], st, U.dist3(t[1], t[2], t[3], cx, cy, cz) }
-                        end
-                    end
-                end
+    local layer = LM.layer
+    local stat = LM.stat
+    for _, t in ipairs(LM.near) do
+        if layer == nil or t[2] == layer then
+            local st = stat[t[5]]
+            if st and st ~= "ok" and t[4] ~= "air" or st == "wrong" then
+                local dx, dy, dz = t[1] + 0.5 - cx, t[2] + 0.5 - cy, t[3] + 0.5 - cz
+                out[#out + 1] = { t[1], t[2], t[3], st, dx * dx + dy * dy + dz * dz, t[4] }
             end
         end
     end
-    tsort(out, function(a, b) return a[5] < b[5] end)
-    while #out > maxBoxes do out[#out] = nil end
+    local maxBoxes = max(1, S.litematicaMaxBoxes)
+    if #out > maxBoxes then
+        -- keep the nearest: bucket by squared distance (a counting sort, no table.sort)
+        local rings, top = {}, 0
+        for _, g in ipairs(out) do
+            local ring = floor(g[5])
+            local list = rings[ring]
+            if not list then list = {} rings[ring] = list end
+            list[#list + 1] = g
+            if ring > top then top = ring end
+        end
+        local kept = {}
+        for ring = 0, top do
+            local list = rings[ring]
+            if list then
+                for _, g in ipairs(list) do
+                    kept[#kept + 1] = g
+                    if #kept >= maxBoxes then break end
+                end
+                if #kept >= maxBoxes then break end
+            end
+        end
+        out = kept
+    end
     LM.ghosts = out
 end
 
-function LM.verify()
-    local ok, missing, wrong = 0, 0, 0
+-- counts from the cache; anything never checked is checked now (up to a budget)
+function LM.verify(budget)
+    local ok, missing, wrong, unknown = 0, 0, 0, 0
+    budget = budget or 20000
     for _, t in ipairs(LM.targets) do
-        local st = LM.state(t)
-        if st == "ok" then ok = ok + 1 elseif st == "missing" then missing = missing + 1 else wrong = wrong + 1 end
+        local st = LM.stat[t[5]]
+        if not st and budget > 0 then
+            budget = budget - 1
+            st = LM.check(t)
+        end
+        if st == "ok" then ok = ok + 1
+        elseif st == "missing" then missing = missing + 1
+        elseif st == "wrong" then wrong = wrong + 1
+        else unknown = unknown + 1 end
     end
-    return ok, missing, wrong
+    return ok, missing, wrong, unknown
 end
 
 -- =====================================================================
@@ -3952,16 +4410,22 @@ function Proc.build()
         local missingItems = {}
         local anyIncomplete = false
         local startLayer = S.buildInLayers and (self.layer or LM.minY) or LM.minY
+        local fresh = 400 -- blocks we may read from the world this pick (the rest comes from the cache)
+        local itemFor = {} -- block name -> item, or false if it's not in the hotbar
+        local KEEP = 24    -- only the nearest few candidates matter
         for layer = startLayer, LM.maxY do
-            local i0 = LM.layerStart[layer]
-            if i0 then
-                local cands = {}
+            local list = LM.layers[layer]
+            if list then
+                local cands = {} -- sorted by distance, at most KEEP long
                 local layerIncomplete = false
                 local blocked = false
-                local i = i0
-                while LM.targets[i] and LM.targets[i][2] == layer do
-                    local t = LM.targets[i]
-                    local st, n = LM.state(t)
+                for _, t in ipairs(list) do
+                    local st, n = LM.stat[t[5]], LM.cur[t[5]]
+                    if not st then
+                        if fresh <= 0 then return nil end -- still scanning; carry on next pick
+                        fresh = fresh - 1
+                        st, n = LM.check(t)
+                    end
                     if st ~= "ok" then
                         layerIncomplete = true
                         local sk = self.skip[t[5]]
@@ -3969,28 +4433,54 @@ function Proc.build()
                         if not sk or sk < now then
                             local act
                             if st == "missing" then
-                                local item = K.itemForBlock(t[4])
-                                if not HB.has(item) then
-                                    missingItems[item] = true
-                                elseif PF.hasSupport(t[1], t[2], t[3]) then
-                                    act = "place"
+                                local item = itemFor[t[4]]
+                                if item == nil then
+                                    local it = K.itemForBlock(t[4])
+                                    item = HB.has(it) and it or false
+                                    itemFor[t[4]] = item
+                                    if not item then missingItems[it] = true end
                                 end
+                                if item then act = "place" end
                             elseif st == "wrong" and (S.buildBreakWrong or t[4] == "air") and not K.unbreakable(n) then
                                 act = "break"
                             end
                             if act then
-                                cands[#cands + 1] = { t = t, act = act, d = U.dist3(ex, ey, ez, t[1] + 0.5, t[2] + 0.5, t[3] + 0.5) }
+                                local dx, dy, dz = t[1] + 0.5 - ex, t[2] + 0.5 - ey, t[3] + 0.5 - ez
+                                local d = dx * dx + dy * dy + dz * dz
+                                local nc = #cands
+                                if (nc < KEEP or d < cands[nc].d2)
+                                    and (act ~= "place" or PF.hasSupport(t[1], t[2], t[3])) then
+                                    local pos = nc + 1
+                                    while pos > 1 and cands[pos - 1].d2 > d do
+                                        cands[pos] = cands[pos - 1]
+                                        pos = pos - 1
+                                    end
+                                    cands[pos] = { t = t, act = act, d2 = d, d = sqrt(d) }
+                                    if #cands > KEEP then cands[#cands] = nil end
+                                end
                             end
                         end
                     end
-                    i = i + 1
                 end
                 if #cands > 0 then
-                    tsort(cands, function(a, b) return a.d < b.d end)
+                    -- the cache can be a moment old: confirm with a fresh read before committing
+                    local j = 1
+                    local checked = 0
+                    while cands[j] and checked < 32 do
+                        local c = cands[j]
+                        local st = LM.check(c.t)
+                        checked = checked + 1
+                        if (c.act == "place" and st ~= "missing") or (c.act == "break" and st ~= "wrong") then
+                            table.remove(cands, j)
+                        else
+                            j = j + 1
+                        end
+                    end
+                    if #cands == 0 then return nil end
                     -- prefer something we can do without moving
-                    for j = 1, min(#cands, 24) do
-                        if cands[j].d <= S.buildReach + 0.5 and self:canActFromHere(cands[j].t, cands[j].act) then
-                            return cands[j].t, cands[j].act, true
+                    for k = 1, min(#cands, 24) do
+                        if cands[k].d <= S.buildReach + 0.5 and self:canActFromHere(cands[k].t, cands[k].act) then
+                            return cands[k].t, cands[k].act, true
                         end
                     end
                     return cands[1].t, cands[1].act, false
@@ -4044,6 +4534,7 @@ function Proc.build()
             else
                 failTarget(t, now)
             end
+            LM.check(t)
             LM.ghostT = 0
             self.phase = "choose"
             return true
@@ -4071,7 +4562,12 @@ function Proc.build()
             end
         end
         if self.phase == "choose" then
+            if self.nextPick and now < self.nextPick then
+                IN.clear()
+                return true
+            end
             local t, act, here = self:pick(now)
+            self.nextPick = (t == nil) and (now + 300) or nil
             if t == "done" then
                 Bot.finish(fmt("Build complete (%d placed, %d broken)", self.placed, self.broken))
                 return true
@@ -4644,8 +5140,16 @@ local function pushBox(t, x1, y1, z1, x2, y2, z2, c)
     pushLine(t, x2, y1, z2, x2, y2, z2, c) pushLine(t, x1, y1, z2, x1, y2, z2, c)
 end
 
+-- box with outline colour c (r,g,b,a) and fill alpha (0 = outline only)
+local function pushFilled(bx, x1, y1, z1, x2, y2, z2, c, fill)
+    local n = #bx
+    bx[n + 1], bx[n + 2], bx[n + 3], bx[n + 4], bx[n + 5], bx[n + 6] = x1, y1, z1, x2, y2, z2
+    bx[n + 7], bx[n + 8], bx[n + 9], bx[n + 10], bx[n + 11] = c[1], c[2], c[3], c[4] or 255, fill or 0
+end
+
+-- DLL renderer: lines (path) + boxes (goal, targets, ghost blocks)
 function REN.build3d()
-    local t = {}
+    local t, bx = {}, {}
     if S.renderPath and NAV.path and (NAV.state == "exec" or NAV.state == "plan") then
         local col = Settings.color("colorCurrentPath", 255)
         local done = Settings.color("colorCurrentPath", 90)
@@ -4664,11 +5168,11 @@ function REN.build3d()
         for i = 1, min(#list, 16) do
             local g = list[i]
             if g.kind == "block" or g.kind == "near" then
-                pushBox(t, g.x, g.y, g.z, g.x + 1, g.y + (g.kind == "near" and 1 or 2), g.z + 1, col)
+                pushFilled(bx, g.x, g.y, g.z, g.x + 1, g.y + (g.kind == "near" and 1 or 2), g.z + 1, col, 0)
             elseif g.kind == "xz" then
                 pushLine(t, g.x + 0.5, P.y - 30, g.z + 0.5, g.x + 0.5, P.y + 60, g.z + 0.5, col)
             elseif g.kind == "y" then
-                pushBox(t, P.x - 2, g.y, P.z - 2, P.x + 2, g.y + 0.02, P.z + 2, col)
+                pushFilled(bx, P.x - 2, g.y, P.z - 2, P.x + 2, g.y + 0.02, P.z + 2, col, 0)
             end
         end
     end
@@ -4677,33 +5181,55 @@ function REN.build3d()
         local n = 0
         for _, v in pairs(Bot.proc.known) do
             if abs(v[1] - P.x) < 32 and abs(v[3] - P.z) < 32 then
-                pushBox(t, v[1], v[2], v[3], v[1] + 1, v[2] + 1, v[3] + 1, col)
+                pushFilled(bx, v[1], v[2], v[3], v[1] + 1, v[2] + 1, v[3] + 1, col, 0)
                 n = n + 1
                 if n > 64 then break end
             end
         end
     end
     if S.litematicaRender and LM.schem then
-        local cMissing = { 90, 170, 255, 200 }
-        local cWrong = { 255, 60, 60, 230 }
+        -- ghost blocks: tinted with the colour of the block that goes there;
+        -- red outline = the wrong block is there
         local inset = 0.03
+        local fill = S.litematicaFill and 95 or 0
+        local wrongOutline = { 255, 40, 40, 255 }
+        local cur = Bot.proc and Bot.proc.name == "build" and Bot.proc.cur and Bot.proc.cur.t
         for _, gb in ipairs(LM.ghosts) do
-            pushBox(t, gb[1] + inset, gb[2] + inset, gb[3] + inset, gb[1] + 1 - inset, gb[2] + 1 - inset, gb[3] + 1 - inset,
-                (gb[4] == "missing") and cMissing or cWrong)
+            local c = K.blockColor(gb[6] or "stone")
+            local outline = (gb[4] == "wrong") and wrongOutline or { c[1], c[2], c[3], 235 }
+            pushFilled(bx, gb[1] + inset, gb[2] + inset, gb[3] + inset, gb[1] + 1 - inset, gb[2] + 1 - inset, gb[3] + 1 - inset,
+                outline, fill)
+        end
+        -- what the HUD is describing, and what the builder is working on
+        local look = LM.look and LM.look.t
+        if look then
+            pushFilled(bx, look[1] - 0.01, look[2] - 0.01, look[3] - 0.01, look[1] + 1.01, look[2] + 1.01, look[3] + 1.01,
+                { 255, 255, 255, 255 }, 0)
+        end
+        if cur then
+            pushFilled(bx, cur[1] - 0.02, cur[2] - 0.02, cur[3] - 0.02, cur[1] + 1.02, cur[2] + 1.02, cur[3] + 1.02,
+                { 255, 230, 60, 255 }, 0)
         end
         local sx, sy, sz = LM.size()
-        pushBox(t, LM.ox, LM.oy, LM.oz, LM.ox + sx, LM.oy + sy, LM.oz + sz, { 255, 255, 255, 120 })
+        pushFilled(bx, LM.ox, LM.oy, LM.oz, LM.ox + sx, LM.oy + sy, LM.oz + sz, { 255, 255, 255, 120 }, 0)
     end
-    return t
+    return t, bx
 end
 
 function REN.update3d(now)
+    local lookText = LM.lookText(now)
     if now >= REN.next3d then
         REN.next3d = now + 100
-        pcall(native.setLines, REN.build3d())
+        local lines, boxes = REN.build3d()
+        pcall(native.setLines, lines)
+        pcall(native.setBoxes, boxes)
     end
-    local visible = S.renderHud and (Bot.isActive() or Bot.paused)
-    local text = REN.status or ""
+    local active = Bot.isActive() or Bot.paused
+    local visible = S.renderHud and (active or lookText ~= nil)
+    local text = active and (REN.status or "") or ""
+    if lookText then
+        text = (text ~= "" and (text .. "  |  ") or "") .. "Schematic: " .. lookText
+    end
     if text ~= REN.lastStatus or visible ~= REN.lastVisible then
         REN.lastStatus, REN.lastVisible = text, visible
         pcall(native.setStatus, text, visible)
@@ -4998,8 +5524,9 @@ local function lmCmd(args)
         U.chat("Ghost blocks " .. (S.litematicaRender and "on" or "off"))
     elseif sub == "materials" or sub == "mats" then
         local counts = {}
+        LM.verify(20000) -- makes sure (almost) everything has been checked
         for _, t in ipairs(LM.targets) do
-            if t[4] ~= "air" and LM.state(t) ~= "ok" then
+            if t[4] ~= "air" and LM.stat[t[5]] ~= "ok" then
                 local it = K.itemForBlock(t[4])
                 counts[it] = (counts[it] or 0) + 1
             end
@@ -5015,8 +5542,9 @@ local function lmCmd(args)
             U.chat(fmt(" %s x%d (%.1f stacks) %s", it, c, c / 64, mark))
         end
     elseif sub == "verify" then
-        local ok, missing, wrong = LM.verify()
-        U.chat(fmt("%s: %d correct, %d missing, %d wrong", LM.schem.name, ok, missing, wrong))
+        local ok, missing, wrong, unknown = LM.verify(20000)
+        local extra = unknown > 0 and fmt(" (%d not checked yet - try again in a few seconds)", unknown) or ""
+        U.chat(fmt("%s: %d correct, %d missing, %d wrong%s", LM.schem.name, ok, missing, wrong, extra))
     elseif sub == "info" then
         local sx, sy, sz = LM.size()
         U.chat(fmt("%s %dx%dx%d at %s rot %d mirror %s", LM.schem.name, sx, sy, sz, U.fmtPos(LM.ox, LM.oy, LM.oz), LM.rot, LM.mirror or "none"))
@@ -5030,6 +5558,42 @@ end
 
 def({ "litematica", "lm", "schematica" }, "lm <list|load|here|origin|move|rotate|mirror|layer|materials|verify|build|unload>",
     "Litematica-style schematic preview & placement (no args = build it)", lmCmd)
+
+-- ---------------------------- diagnostics ----------------------------
+local function ageText(ms)
+    if ms == nil then return "?" end
+    if ms < 0 then return "\194\167cnever fired\194\167r" end
+    if ms > 1500 then return fmt("\194\167cstopped (%.1fs ago)\194\167r", ms / 1000) end
+    return "\194\167aOK\194\167r"
+end
+
+local function yn(v) return v and "\194\167ayes\194\167r" or "\194\167cno\194\167r" end
+
+def({ "debug", "diag", "diagnostics" }, "debug", "Show what's working (game hooks, input, turning). Send this if the bot won't move", function(args)
+    U.chat(fmt("Baritone %s, %s", VERSION, NATIVE and tostring(native.version) or ("Flarial + helper " .. tostring(Helper.version))))
+    if NATIVE then
+        local st = IN.stats(U.now() + 1000) or {}
+        U.chat(fmt("Game tick hook: %s  |  movement hook: %s  |  bot ticks from: %s", ageText(st.tickAge), ageText(st.moveAge),
+            DBG.tickSource))
+        U.chat(fmt("Window focused: %s  |  in game HUD: %s  |  cursor grabbed: %s  |  Latite menu open: %s",
+            yn(st.focused), yn(st.inHud), yn(st.cursorGrabbed), yn(st.latiteMenu)))
+        local dead = {}
+        if st.deadTick then dead[#dead + 1] = "tick" end
+        if st.deadMove then dead[#dead + 1] = "movement" end
+        if st.deadTurn then dead[#dead + 1] = "mouse-look" end
+        if st.deadMouse then dead[#dead + 1] = "mouse input" end
+        U.chat("Game functions not found on this version: " .. (#dead > 0 and ("\194\167c" .. tconcat(dead, ", ") .. "\194\167r") or "\194\167anone\194\167r"))
+        U.chat(fmt("Input: %s (%s in use)  |  turning: %s%s", tostring(S.inputMode), IN.inputMode(), IN.rotMode(),
+            IN.turnMode() and fmt(" (%.4f deg/px)", S.mouseYawPerPixel) or ""))
+    end
+    local fx, fy, fz = NAV.feet()
+    U.chat(fmt("You: %.2f %.2f %.2f  yaw %.1f  pitch %.1f  on ground %s  |  block below: %s", P.x, P.y, P.z, P.yaw, P.pitch,
+        yn(P.grounded), W.fresh(fx, fy - 1, fz)))
+    U.chat(fmt("Bot: %s  |  path: %s %s  |  hotbar: %s", Bot.status(), NAV.state, NAV.info or "", HB.list()))
+    if LM.schem then
+        U.chat(fmt("Schematic: %s, %d blocks, %d checked, %d ghosts shown", LM.schem.name, #LM.targets, LM.known, #LM.ghosts))
+    end
+end)
 
 -- ---------------------------- control --------------------------------
 def({ "stop", "cancel", "forcecancel" }, "stop", "Stop everything", function(args)
@@ -5241,13 +5805,23 @@ function Main.frame()
     if dt < 0 then dt = 0 end
     Main.lastFrame = now
     Main.init()
+    DBG.frames = DBG.frames + 1
     Helper.poll(now)
     P.refresh()
     REN.px, REN.py, REN.pz = P.x, P.y, P.z
     if not P.valid then
         IN.frame(now, dt, false)
-        if NATIVE then pcall(native.setLines, {}) pcall(native.setStatus, "", false) end
+        if NATIVE then pcall(native.setLines, {}) pcall(native.setBoxes, {}) pcall(native.setStatus, "", false) end
         return
+    end
+    -- the bot logic runs on the game tick; if that hook isn't firing on this
+    -- game version, run it from the frame loop at 20 per second instead
+    if not DBG.realTickT or now - DBG.realTickT > 250 then
+        if now - (Main.synthT or 0) >= 50 then
+            Main.synthT = now
+            DBG.tickSource = "frame"
+            Main.tick()
+        end
     end
     W.updateDimension()
     NAV.frame(now)
@@ -5294,6 +5868,8 @@ onEvent("SetupAndRenderEvent", function()
 end)
 
 onEvent("TickEvent", function()
+    DBG.realTickT = U.now()
+    DBG.tickSource = "game"
     safe(Main.tick)
 end)
 
@@ -5390,5 +5966,5 @@ end
 
 -- test hook (only used by the offline simulator)
 if rawget(_G, "BARITONE_EXPOSE") then
-    BARITONE_EXPOSE = { NAV = NAV, Bot = Bot, P = P, W = W, LM = LM, HB = HB, IN = IN, S = S, PF = PF, K = K, G = G, ACT = ACT, U = U }
+    BARITONE_EXPOSE = { NAV = NAV, Bot = Bot, P = P, W = W, LM = LM, HB = HB, IN = IN, S = S, PF = PF, K = K, G = G, ACT = ACT, U = U, REN = REN, CMD = CMD, DBG = DBG }
 end

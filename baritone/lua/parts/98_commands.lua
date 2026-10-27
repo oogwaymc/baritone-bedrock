@@ -287,8 +287,9 @@ local function lmCmd(args)
         U.chat("Ghost blocks " .. (S.litematicaRender and "on" or "off"))
     elseif sub == "materials" or sub == "mats" then
         local counts = {}
+        LM.verify(20000) -- makes sure (almost) everything has been checked
         for _, t in ipairs(LM.targets) do
-            if t[4] ~= "air" and LM.state(t) ~= "ok" then
+            if t[4] ~= "air" and LM.stat[t[5]] ~= "ok" then
                 local it = K.itemForBlock(t[4])
                 counts[it] = (counts[it] or 0) + 1
             end
@@ -304,8 +305,9 @@ local function lmCmd(args)
             U.chat(fmt(" %s x%d (%.1f stacks) %s", it, c, c / 64, mark))
         end
     elseif sub == "verify" then
-        local ok, missing, wrong = LM.verify()
-        U.chat(fmt("%s: %d correct, %d missing, %d wrong", LM.schem.name, ok, missing, wrong))
+        local ok, missing, wrong, unknown = LM.verify(20000)
+        local extra = unknown > 0 and fmt(" (%d not checked yet - try again in a few seconds)", unknown) or ""
+        U.chat(fmt("%s: %d correct, %d missing, %d wrong%s", LM.schem.name, ok, missing, wrong, extra))
     elseif sub == "info" then
         local sx, sy, sz = LM.size()
         U.chat(fmt("%s %dx%dx%d at %s rot %d mirror %s", LM.schem.name, sx, sy, sz, U.fmtPos(LM.ox, LM.oy, LM.oz), LM.rot, LM.mirror or "none"))
@@ -319,6 +321,42 @@ end
 
 def({ "litematica", "lm", "schematica" }, "lm <list|load|here|origin|move|rotate|mirror|layer|materials|verify|build|unload>",
     "Litematica-style schematic preview & placement (no args = build it)", lmCmd)
+
+-- ---------------------------- diagnostics ----------------------------
+local function ageText(ms)
+    if ms == nil then return "?" end
+    if ms < 0 then return "\194\167cnever fired\194\167r" end
+    if ms > 1500 then return fmt("\194\167cstopped (%.1fs ago)\194\167r", ms / 1000) end
+    return "\194\167aOK\194\167r"
+end
+
+local function yn(v) return v and "\194\167ayes\194\167r" or "\194\167cno\194\167r" end
+
+def({ "debug", "diag", "diagnostics" }, "debug", "Show what's working (game hooks, input, turning). Send this if the bot won't move", function(args)
+    U.chat(fmt("Baritone %s, %s", VERSION, NATIVE and tostring(native.version) or ("Flarial + helper " .. tostring(Helper.version))))
+    if NATIVE then
+        local st = IN.stats(U.now() + 1000) or {}
+        U.chat(fmt("Game tick hook: %s  |  movement hook: %s  |  bot ticks from: %s", ageText(st.tickAge), ageText(st.moveAge),
+            DBG.tickSource))
+        U.chat(fmt("Window focused: %s  |  in game HUD: %s  |  cursor grabbed: %s  |  Latite menu open: %s",
+            yn(st.focused), yn(st.inHud), yn(st.cursorGrabbed), yn(st.latiteMenu)))
+        local dead = {}
+        if st.deadTick then dead[#dead + 1] = "tick" end
+        if st.deadMove then dead[#dead + 1] = "movement" end
+        if st.deadTurn then dead[#dead + 1] = "mouse-look" end
+        if st.deadMouse then dead[#dead + 1] = "mouse input" end
+        U.chat("Game functions not found on this version: " .. (#dead > 0 and ("\194\167c" .. tconcat(dead, ", ") .. "\194\167r") or "\194\167anone\194\167r"))
+        U.chat(fmt("Input: %s (%s in use)  |  turning: %s%s", tostring(S.inputMode), IN.inputMode(), IN.rotMode(),
+            IN.turnMode() and fmt(" (%.4f deg/px)", S.mouseYawPerPixel) or ""))
+    end
+    local fx, fy, fz = NAV.feet()
+    U.chat(fmt("You: %.2f %.2f %.2f  yaw %.1f  pitch %.1f  on ground %s  |  block below: %s", P.x, P.y, P.z, P.yaw, P.pitch,
+        yn(P.grounded), W.fresh(fx, fy - 1, fz)))
+    U.chat(fmt("Bot: %s  |  path: %s %s  |  hotbar: %s", Bot.status(), NAV.state, NAV.info or "", HB.list()))
+    if LM.schem then
+        U.chat(fmt("Schematic: %s, %d blocks, %d checked, %d ghosts shown", LM.schem.name, #LM.targets, LM.known, #LM.ghosts))
+    end
+end)
 
 -- ---------------------------- control --------------------------------
 def({ "stop", "cancel", "forcecancel" }, "stop", "Stop everything", function(args)

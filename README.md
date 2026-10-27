@@ -11,8 +11,9 @@ It's built on [Latite Client](https://github.com/LatiteClient/Latite) (26.50 bra
 
 ## How it works
 
-- **Movement** goes through the game's own input state (the same fields the keyboard writes: forward/back/left/right, jump, sneak, sprint), so it moves like a real player.
-- **Looking** writes the player's rotation, turned smoothly at `rotationSpeed`. If a game version ignores that, it switches automatically to the game's mouse-look path and calibrates it.
+- **Movement** goes through the game's own input state (the same fields the keyboard writes: forward/back/left/right, jump, sneak, sprint), so it moves like a real player. If the game doesn't take that input (or the hook isn't found on your version), it switches by itself to pressing your real movement keys (`inputMode`, `keyForward` …).
+- **Looking** writes the player's rotation, turned smoothly at `rotationSpeed`. If a game version ignores that (or you don't walk the way the bot is looking), it switches automatically to the game's mouse-look, then to real mouse movement, and calibrates (`rotationMode`).
+- If the game's tick hook isn't found on your version, the bot runs from the frame loop instead.
 - **Breaking, placing and using items** are real mouse clicks. **Hotbar switching** uses real number-key presses. Both are only sent while Minecraft is focused and no menu is open.
 - **World, player, inventory and entities** are read directly from the game, so `#follow` knows exactly where people are and the hotbar is always known.
 - **Path, goal, mining targets and schematic ghost blocks** are drawn as 3D lines with the game's own renderer.
@@ -46,6 +47,7 @@ The Baritone module is on by default. Press **M** to open the menu, where you ca
 | `#tunnel [length]` | 1x2 tunnel straight ahead |
 | `#wp save/goto/list/delete <name>` · `#sethome` · `#home` | waypoints |
 | `#stop` · `#pause` · `#resume` · `#status` · `#hotbar` | |
+| `#debug` | what's working on your game version (hooks, input, turning). Send this if the bot won't move |
 | `#set <name> <value>` · `#set reset` · `#settings [page/search]` · `#modified` | settings (saved automatically) |
 | `#reload` | restart the bot script (picks up a `Baritone.lua` override) |
 
@@ -59,7 +61,9 @@ Put `.litematic`, `.mcstructure`, `.schem` (Sponge v2/v3) or Java structure `.nb
 #lm render · #lm build (or #build house)
 ```
 
-Ghost blocks: blue = missing, red = wrong. The builder places from your hotbar and pauses with a list when something's missing.
+Ghost blocks are tinted with the colour of the block that goes there (oak planks look like oak, red wool is red …). A red outline means the wrong block is there. Look at a ghost block and the HUD tells you exactly what goes there, e.g. `Schematic: oak_stairs (missing)`. The block the builder is working on has a yellow outline.
+
+The builder places from your hotbar and pauses with a list when something's missing. Big schematics are checked a little at a time (`litematicaScanPerFrame`), so they don't lag the game; `litematicaMaxBoxes` and `litematicaRenderRadius` limit how many ghost blocks are drawn.
 
 ## Files
 

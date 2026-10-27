@@ -13,6 +13,8 @@
 #include "client/event/events/RenderLevelEvent.h"
 #include "client/event/events/ChatEvent.h"
 #include "client/event/events/AfterMoveEvent.h"
+#include "client/event/events/BeforeMoveEvent.h"
+#include "mc/Addresses.h"
 #include "client/event/events/KeyUpdateEvent.h"
 #include "client/event/events/LeaveGameEvent.h"
 #include "client/misc/Notifications.h"
@@ -161,6 +163,20 @@ namespace {
         in.type = INPUT_KEYBOARD;
         in.ki.wScan = static_cast<WORD>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
         in.ki.dwFlags = KEYEVENTF_SCANCODE | (down ? 0 : KEYEVENTF_KEYUP);
+        // right-hand Ctrl/Alt and the arrow keys etc. need the extended flag
+        if (vk == VK_RCONTROL || vk == VK_RMENU || (vk >= VK_PRIOR && vk <= VK_DOWN) || vk == VK_INSERT ||
+            vk == VK_DELETE) {
+            in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        SendInput(1, &in, sizeof(INPUT));
+    }
+
+    void sendMouseMove(int dx, int dy) {
+        INPUT in {};
+        in.type = INPUT_MOUSE;
+        in.mi.dx = dx;
+        in.mi.dy = dy;
+        in.mi.dwFlags = MOUSEEVENTF_MOVE;
         SendInput(1, &in, sizeof(INPUT));
     }
 
@@ -696,6 +712,92 @@ namespace {
         return 0;
     }
 
+    // native.setBoxes({ x1,y1,z1, x2,y2,z2, r,g,b,a, fill,  ... })  colours and alphas 0-255
+    int l_native_setBoxes(lua_State* L) {
+        auto m = mod();
+        if (!m) return 0;
+        luaL_checktype(L, 1, LUA_TTABLE);
+        lua_Integer n = luaL_len(L, 1);
+        std::vector<BaritoneModule::Box> boxes;
+        boxes.reserve(static_cast<size_t>(n / 11));
+        for (lua_Integer i = 1; i + 10 <= n; i += 11) {
+            float v[11];
+            for (int k = 0; k < 11; k++) {
+                lua_rawgeti(L, 1, i + k);
+                v[k] = static_cast<float>(lua_tonumber(L, -1));
+                lua_pop(L, 1);
+            }
+            boxes.push_back({ v[0], v[1], v[2], v[3], v[4], v[5], v[6] / 255.f, v[7] / 255.f, v[8] / 255.f,
+                              v[9] / 255.f, v[10] / 255.f });
+        }
+        std::lock_guard lock { m->stateMutex };
+        m->boxes = std::move(boxes);
+        return 0;
+    }
+
+    // native.setInputMode("hook" | "keys")
+    //   hook: write the game's movement input state (default)
+    //   keys: press the real movement keys (fallback if the hook doesn't move the player)
+    int l_native_setInputMode(lua_State* L) {
+        auto m = mod();
+        if (!m) return 0;
+        std::string mode = luaL_checkstring(L, 1);
+        std::lock_guard lock { m->stateMutex };
+        m->inputMode = (mode == "keys") ? BaritoneModule::InputMode::Keys : BaritoneModule::InputMode::Hook;
+        return 0;
+    }
+
+    // native.setMoveKeys(forward, back, left, right, jump, sneak, sprint) - virtual-key codes for keys mode
+    int l_native_setMoveKeys(lua_State* L) {
+        auto m = mod();
+        if (!m) return 0;
+        std::lock_guard lock { m->stateMutex };
+        for (int i = 0; i < 7; i++) {
+            lua_Integer vk = luaL_optinteger(L, i + 1, 0);
+            if (vk > 0 && vk < 256) m->moveKeys[i] = static_cast<unsigned short>(vk);
+        }
+        return 0;
+    }
+
+    // native.mouseMove(dx, dy) - a real relative mouse movement (only while the game is focused, in the HUD)
+    int l_native_mouseMove(lua_State* L) {
+        int dx = static_cast<int>(luaL_checknumber(L, 1));
+        int dy = static_cast<int>(luaL_checknumber(L, 2));
+        auto m = mod();
+        bool ok = m && m->isGameFocused() && m->isInHud();
+        if (ok && (dx != 0 || dy != 0)) sendMouseMove(dx, dy);
+        lua_pushboolean(L, ok);
+        return 1;
+    }
+
+    // native.stats() - diagnostics for #debug and the automatic fallbacks
+    int l_native_stats(lua_State* L) {
+        auto m = mod();
+        lua_createtable(L, 0, 20);
+        if (!m) return 1;
+        double now = nowMs();
+        auto age = [now](long long t) { return t < 0 ? -1.0 : now - static_cast<double>(t); };
+        setField(L, "tickAge", age(m->lastTickMs.load()));
+        setField(L, "moveAge", age(m->lastMoveMs.load()));
+        setFieldBool(L, "focused", m->isGameFocused());
+        setFieldBool(L, "inHud", m->isInHud());
+        auto ci = client();
+        setFieldBool(L, "cursorGrabbed", ci && ci->minecraftGame && ci->minecraftGame->isCursorGrabbed());
+        setFieldBool(L, "latiteMenu", Latite::getScreenManager().getActiveScreen().has_value());
+        setFieldBool(L, "deadTick", Signatures::MultiPlayerLevel__subTick.result == 0);
+        setFieldBool(L, "deadMove", Signatures::ClientInputUpdateSystemInternal_tickUpdateClientInput.result == 0);
+        setFieldBool(L, "deadTurn", Signatures::LocalPlayer_applyTurnDelta.result == 0);
+        setFieldBool(L, "deadMouse", Signatures::GameCore_handleMouseInput.result == 0);
+        auto lp = localPlayer();
+        setFieldBool(L, "rotationComponent", lp != nullptr && lp->actorRotation != nullptr);
+        std::lock_guard lock { m->stateMutex };
+        setField(L, "inputMode", std::string(m->inputMode == BaritoneModule::InputMode::Keys ? "keys" : "hook"));
+        setField(L, "lines", static_cast<double>(m->lines.size()));
+        setField(L, "boxes", static_cast<double>(m->boxes.size()));
+        setFieldBool(L, "moveActive", m->move.active);
+        return 1;
+    }
+
     // native.setStatus(text, visible)
     int l_native_setStatus(lua_State* L) {
         auto m = mod();
@@ -748,6 +850,7 @@ BaritoneModule::BaritoneModule()
     listen<RenderLevelEvent>(static_cast<EventListenerFunc>(&BaritoneModule::onRenderLevel));
     listen<ChatEvent>(static_cast<EventListenerFunc>(&BaritoneModule::onChat));
     listen<AfterMoveEvent>(static_cast<EventListenerFunc>(&BaritoneModule::onAfterMove));
+    listen<BeforeMoveEvent>(static_cast<EventListenerFunc>(&BaritoneModule::onBeforeMove));
     listen<KeyUpdateEvent>(static_cast<EventListenerFunc>(&BaritoneModule::onKey), true);
     listen<LeaveGameEvent>(static_cast<EventListenerFunc>(&BaritoneModule::onLeaveGame), true);
 }
@@ -869,6 +972,11 @@ bool BaritoneModule::startLua() {
                                           { "panicCount", l_native_panicCount },
                                           { "setLines", l_native_setLines },
                                           { "setStatus", l_native_setStatus },
+                                          { "setBoxes", l_native_setBoxes },
+                                          { "setInputMode", l_native_setInputMode },
+                                          { "setMoveKeys", l_native_setMoveKeys },
+                                          { "mouseMove", l_native_mouseMove },
+                                          { "stats", l_native_stats },
                                           { nullptr, nullptr } };
     registerTable(L, "player", playerFns);
     registerTable(L, "world", worldFns);
@@ -877,7 +985,7 @@ bool BaritoneModule::startLua() {
     registerTable(L, "fs", fsFns);
     registerTable(L, "native", nativeFns);
     lua_getglobal(L, "native");
-    lua_pushstring(L, "BaritoneDLL 1.0");
+    lua_pushstring(L, "BaritoneDLL 1.1");
     lua_setfield(L, -2, "version");
     lua_pop(L, 1);
     lua_register(L, "log", l_log);
@@ -999,8 +1107,10 @@ void BaritoneModule::releaseAllInput() {
         pendingClicks[1] = pendingClicks[2] = 0;
         pendingSlot = -1;
         lines.clear();
+        boxes.clear();
         statusVisible = false;
     }
+    releaseMoveKeys();
     if (sentLmb || tapLeft) {
         sendMouse(MOUSEEVENTF_LEFTUP);
         sentLmb = tapLeft = false;
@@ -1015,15 +1125,29 @@ void BaritoneModule::releaseAllInput() {
     }
 }
 
+void BaritoneModule::releaseMoveKeys() {
+    for (auto& vk : keysDown) {
+        if (vk) {
+            sendKey(vk, false);
+            vk = 0;
+        }
+    }
+}
+
 // Real clicks and hotbar keys - only while Minecraft is focused and no menu is open
 void BaritoneModule::applyMouseAndKeys() {
     bool canSend = isGameFocused() && isInHud();
     bool lmb, rmb;
     int clicks[3];
     int slot;
+    unsigned short wantKeys[7] = {};
     {
         std::lock_guard lock { stateMutex };
         bool active = move.active;
+        if (inputMode == InputMode::Keys && active && canSend) {
+            const bool want[7] = { move.forward, move.back, move.left, move.right, move.jump, move.sneak, move.sprint };
+            for (int i = 0; i < 7; i++) wantKeys[i] = want[i] ? moveKeys[i] : static_cast<unsigned short>(0);
+        }
         lmb = lmbWanted && active;
         rmb = rmbWanted && active;
         clicks[1] = pendingClicks[1];
@@ -1037,6 +1161,13 @@ void BaritoneModule::applyMouseAndKeys() {
         lmb = rmb = false;
         clicks[1] = clicks[2] = 0;
         slot = -1;
+    }
+    // movement keys (keys input mode): press / release whatever changed
+    for (int i = 0; i < 7; i++) {
+        if (keysDown[i] == wantKeys[i]) continue;
+        if (keysDown[i]) sendKey(keysDown[i], false);
+        if (wantKeys[i]) sendKey(wantKeys[i], true);
+        keysDown[i] = wantKeys[i];
     }
     // finish last frame's taps (each key/click is held for one frame)
     if (heldSlotKey) {
@@ -1081,6 +1212,7 @@ void BaritoneModule::applyMouseAndKeys() {
 // Events
 // ---------------------------------------------------------------------------
 void BaritoneModule::onTick(Event&) {
+    lastTickMs = static_cast<long long>(nowMs());
     if (!localPlayer()) return;
     std::lock_guard lock { luaMutex };
     if (!L && !luaFailed) startLua();
@@ -1120,16 +1252,52 @@ void BaritoneModule::onRenderLevel(Event& evG) {
     if (!std::get<BoolValue>(renderPath)) return;
     auto& ev = reinterpret_cast<RenderLevelEvent&>(evG);
     std::vector<Line> copy;
+    std::vector<Box> boxCopy;
     {
         std::lock_guard lock { stateMutex };
-        if (lines.empty()) return;
+        if (lines.empty() && boxes.empty()) return;
         copy = lines;
+        boxCopy = boxes;
     }
     auto ci = client();
     if (!ci || !ci->levelRenderer || !localPlayer()) return;
     MCDrawUtil3D dc { ci->levelRenderer, ev.getScreenContext(), SDK::MaterialPtr::getSelectionOverlayMaterial() };
+
+    // translucent faces (ghost blocks are tinted with the colour of the block that goes there)
+    bool anyFill = false;
+    for (auto const& b : boxCopy) {
+        if (b.fill <= 0.f) continue;
+        anyFill = true;
+        d2d::Color c(b.r, b.g, b.b, b.fill);
+        const float x1 = b.x1, y1 = b.y1, z1 = b.z1, x2 = b.x2, y2 = b.y2, z2 = b.z2;
+        dc.fillQuad({ x1, y1, z1 }, { x2, y1, z1 }, { x2, y1, z2 }, { x1, y1, z2 }, c); // bottom
+        dc.fillQuad({ x1, y2, z1 }, { x2, y2, z1 }, { x2, y2, z2 }, { x1, y2, z2 }, c); // top
+        dc.fillQuad({ x1, y1, z1 }, { x2, y1, z1 }, { x2, y2, z1 }, { x1, y2, z1 }, c); // north
+        dc.fillQuad({ x1, y1, z2 }, { x2, y1, z2 }, { x2, y2, z2 }, { x1, y2, z2 }, c); // south
+        dc.fillQuad({ x1, y1, z1 }, { x1, y2, z1 }, { x1, y2, z2 }, { x1, y1, z2 }, c); // west
+        dc.fillQuad({ x2, y1, z1 }, { x2, y2, z1 }, { x2, y2, z2 }, { x2, y1, z2 }, c); // east
+    }
+    if (anyFill) dc.flush();
+
     for (auto const& l : copy) {
         dc.drawLine({ l.x1, l.y1, l.z1 }, { l.x2, l.y2, l.z2 }, d2d::Color(l.r, l.g, l.b, l.a));
+    }
+    for (auto const& b : boxCopy) {
+        if (b.a <= 0.f) continue;
+        d2d::Color c(b.r, b.g, b.b, b.a);
+        const float x1 = b.x1, y1 = b.y1, z1 = b.z1, x2 = b.x2, y2 = b.y2, z2 = b.z2;
+        dc.drawLine({ x1, y1, z1 }, { x2, y1, z1 }, c);
+        dc.drawLine({ x2, y1, z1 }, { x2, y1, z2 }, c);
+        dc.drawLine({ x2, y1, z2 }, { x1, y1, z2 }, c);
+        dc.drawLine({ x1, y1, z2 }, { x1, y1, z1 }, c);
+        dc.drawLine({ x1, y2, z1 }, { x2, y2, z1 }, c);
+        dc.drawLine({ x2, y2, z1 }, { x2, y2, z2 }, c);
+        dc.drawLine({ x2, y2, z2 }, { x1, y2, z2 }, c);
+        dc.drawLine({ x1, y2, z2 }, { x1, y2, z1 }, c);
+        dc.drawLine({ x1, y1, z1 }, { x1, y2, z1 }, c);
+        dc.drawLine({ x2, y1, z1 }, { x2, y2, z1 }, c);
+        dc.drawLine({ x2, y1, z2 }, { x2, y2, z2 }, c);
+        dc.drawLine({ x1, y1, z2 }, { x1, y2, z2 }, c);
     }
     dc.flush();
 }
@@ -1171,19 +1339,31 @@ void BaritoneModule::onChat(Event& evG) {
     }
 }
 
-// The game has just read the keyboard into rawInputState: overwrite it with
-// what the bot wants while the bot is driving.
+// The game's input update reads rawInputState into the player's movement.
+// While the bot is driving, write what it wants both before the update (so
+// it's used this tick) and after it (so the keyboard can't override it).
+void BaritoneModule::onBeforeMove(Event& evG) {
+    auto& ev = reinterpret_cast<BeforeMoveEvent&>(evG);
+    writeMoveInput(ev.getMoveInputHandler(), true);
+}
+
 void BaritoneModule::onAfterMove(Event& evG) {
     auto& ev = reinterpret_cast<AfterMoveEvent&>(evG);
-    SDK::MoveInputComponent* input = ev.getMoveInputHandler();
+    lastMoveMs = static_cast<long long>(nowMs());
+    writeMoveInput(ev.getMoveInputHandler(), false);
+}
+
+void BaritoneModule::writeMoveInput(SDK::MoveInputComponent* input, bool before) {
     if (!input) return;
     MoveState m;
+    InputMode mode;
     {
         std::lock_guard lock { stateMutex };
         m = move;
+        mode = inputMode;
     }
-    if (!m.active || !isInHud()) {
-        lastJump = lastSneak = false;
+    if (mode != InputMode::Hook || !m.active || !isInHud()) {
+        if (!before) lastJump = lastSneak = false;
         return;
     }
     auto& s = input->rawInputState;
@@ -1203,8 +1383,10 @@ void BaritoneModule::onAfterMove(Event& evG) {
     s.sneakInputWasPressed = m.sneak && !lastSneak;
     s.sneakInputWasReleased = !m.sneak && lastSneak;
 
-    lastJump = m.jump;
-    lastSneak = m.sneak;
+    if (!before) {
+        lastJump = m.jump;
+        lastSneak = m.sneak;
+    }
 }
 
 void BaritoneModule::onKey(Event& evG) {

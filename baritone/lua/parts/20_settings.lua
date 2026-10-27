@@ -46,7 +46,10 @@ defSetting("maxPathNodes", "int", 30000, "Max nodes explored per path search")
 defSetting("autoTool", "bool", true, "Switch to the best tool in the hotbar when breaking")
 defSetting("sprintMinHunger", "int", 7, "Do not sprint below this hunger")
 defSetting("rotationSpeed", "float", 540, "Max camera turn speed (degrees per second)")
-defSetting("rotationMode", "string", "set", "DLL only: 'set' writes the rotation directly, 'turn' uses the game's mouse-look (needs #calibrate)")
+defSetting("rotationMode", "string", "set",
+    "DLL only: 'set' writes the rotation directly, 'turn' uses the game's mouse-look, 'mouse' moves the real mouse ('turn' and 'mouse' need #calibrate)")
+defSetting("inputMode", "string", "auto",
+    "DLL only: 'hook' writes the game's movement input, 'keys' presses your movement keys, 'auto' starts with hook and switches to keys if you don't move")
 defSetting("walkPitch", "float", 12, "Camera pitch while walking")
 
 -- Rendering
@@ -82,7 +85,10 @@ defSetting("buildIgnoreMissingItems", "bool", false, "Skip blocks you have no it
 defSetting("buildReach", "float", 4.5, "Reach used for placing and breaking")
 defSetting("litematicaRender", "bool", true, "Draw the loaded schematic as ghost blocks")
 defSetting("litematicaRenderRadius", "int", 10, "Ghost block render radius")
-defSetting("litematicaMaxBoxes", "int", 250, "Max ghost boxes drawn per frame")
+defSetting("litematicaMaxBoxes", "int", 200, "Max ghost boxes drawn per frame")
+defSetting("litematicaFill", "bool", true, "Tint ghost blocks with the colour of the block that goes there")
+defSetting("litematicaShowLooking", "bool", true, "Show which schematic block you're looking at on the HUD")
+defSetting("litematicaScanPerFrame", "int", 150, "Schematic blocks re-checked per frame (higher = quicker updates, more lag)")
 
 -- Elytra
 defSetting("elytraCruiseHeight", "int", 40, "Cruise altitude above takeoff point / terrain")

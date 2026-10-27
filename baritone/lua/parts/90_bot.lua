@@ -154,8 +154,18 @@ function Proc.calibrate(announce)
                 if abs(d) < 0.5 then
                     self.tries = self.tries + 1
                     if self.tries >= 2 then
-                        if NATIVE then
-                            U.chat("\194\167cThe camera didn't move. Set #set rotationMode set and try again.")
+                        if NATIVE and IN.rotMode() == "turn" then
+                            -- the game's mouse-look didn't turn us: try real mouse movement
+                            S.rotationMode = "mouse"
+                            Settings.save()
+                            U.chat("\194\167eMouse-look didn't turn the camera - trying real mouse movement.")
+                            self.tries = 0
+                            self.phase = "wait"
+                            self.t = now
+                            return "running"
+                        elseif NATIVE then
+                            U.chat("\194\167cThe camera didn't move with any method. Type " .. S.prefix
+                                .. "debug and send the developer what it says. (" .. S.prefix .. "set rotationMode set to reset)")
                         else
                             U.chat("\194\167cThe camera didn't move. Check that BaritoneHelper.exe is running (as admin if Minecraft runs as admin) and the game window is focused.")
                         end

@@ -370,8 +370,13 @@ end
 -- =====================================================================
 -- Litematica-style placement of the loaded schematic
 -- =====================================================================
+-- targets: every block of the placement { x, y, z, name, key }
+-- layers[y]: the targets in that layer; buckets: targets per 16x16x16 section
+-- stat[key]: cached "ok" / "missing" / "wrong", kept fresh by a scanner that
+-- checks a few hundred blocks per frame (so big schematics don't lag the game)
 local LM = { schem = nil, ox = 0, oy = 0, oz = 0, rot = 0, mirror = nil, targets = {}, byKey = {},
-    buckets = {}, minY = 0, maxY = -1, layer = nil, ghosts = {}, ghostT = 0, loading = nil }
+    buckets = {}, layers = {}, minY = 0, maxY = -1, layer = nil, ghosts = {}, ghostT = 0, loading = nil,
+    stat = {}, cur = {}, known = 0, scanI = 1, near = {}, nearI = 1, nearT = 0, nearCell = nil, look = nil, lookT = 0 }
 
 function LM.transform(x, y, z)
     local s = LM.schem
@@ -393,10 +398,15 @@ end
 
 function LM.rebuild()
     local s = LM.schem
-    LM.targets, LM.byKey, LM.buckets = {}, {}, {}
+    LM.targets, LM.byKey, LM.buckets, LM.layers = {}, {}, {}, {}
+    LM.stat, LM.cur, LM.known, LM.scanI = {}, {}, 0, 1
+    LM.near, LM.nearI, LM.nearT, LM.nearCell = {}, 1, 0, nil
+    LM.ghosts, LM.ghostT, LM.look = {}, 0, nil
     if not s then return end
     local includeAir = S.buildClearAir
     local sx, sz = s.sx, s.sz
+    local minY, maxY = INF, -INF
+    local targets, byKey, layers, buckets = LM.targets, LM.byKey, LM.layers, LM.buckets
     for idx, id in pairs(s.data) do
         local name = s.pal[id]
         if name and (name ~= "air" or includeAir) then
@@ -407,28 +417,155 @@ function LM.rebuild()
             local wx, wy, wz = LM.transform(x, y, z)
             local k = U.key(wx, wy, wz)
             local t = { wx, wy, wz, name, k }
-            LM.targets[#LM.targets + 1] = t
-            LM.byKey[k] = name
+            targets[#targets + 1] = t
+            byKey[k] = name
+            local layer = layers[wy]
+            if not layer then layer = {} layers[wy] = layer end
+            layer[#layer + 1] = t
+            local bk = U.key(wx // 16, wy // 16, wz // 16)
+            local b = buckets[bk]
+            if not b then b = {} buckets[bk] = b end
+            b[#b + 1] = t
+            if wy < minY then minY = wy end
+            if wy > maxY then maxY = wy end
         end
     end
-    tsort(LM.targets, function(a, b)
-        if a[2] ~= b[2] then return a[2] < b[2] end
-        if a[1] ~= b[1] then return a[1] < b[1] end
-        return a[3] < b[3]
-    end)
-    LM.minY, LM.maxY = INF, -INF
-    LM.layerStart = {}
-    for i, t in ipairs(LM.targets) do
-        if t[2] < LM.minY then LM.minY = t[2] end
-        if t[2] > LM.maxY then LM.maxY = t[2] end
-        if not LM.layerStart[t[2]] then LM.layerStart[t[2]] = i end
-        local bk = U.key(t[1] // 16, 0, t[3] // 16)
-        local b = LM.buckets[bk]
-        if not b then b = {} LM.buckets[bk] = b end
-        b[#b + 1] = t
+    LM.minY, LM.maxY = minY, maxY
+end
+
+-- fresh check of one target (updates the cache)
+function LM.check(t)
+    local st, n = LM.state(t)
+    local k = t[5]
+    if LM.stat[k] == nil then LM.known = LM.known + 1 end
+    LM.stat[k] = st
+    LM.cur[k] = n
+    return st, n
+end
+
+-- cached state, checking it now if it's never been checked
+function LM.cached(t)
+    local st = LM.stat[t[5]]
+    if st then return st, LM.cur[t[5]] end
+    return LM.check(t)
+end
+
+-- targets near the player (rebuilt when the player moves a few blocks)
+function LM.refreshNear(now)
+    local r = S.litematicaRenderRadius
+    local cx, cy, cz = P.fx, P.fy, P.fz
+    local cell = U.key(cx // 3, cy // 3, cz // 3)
+    if cell == LM.nearCell and now - LM.nearT < 3000 then return end
+    LM.nearCell, LM.nearT = cell, now
+    local out = {}
+    for bx = (cx - r) // 16, (cx + r) // 16 do
+        for by = (cy - r) // 16, (cy + r) // 16 do
+            for bz = (cz - r) // 16, (cz + r) // 16 do
+                local b = LM.buckets[U.key(bx, by, bz)]
+                if b then
+                    for _, t in ipairs(b) do
+                        if abs(t[1] - cx) <= r and abs(t[3] - cz) <= r and abs(t[2] - cy) <= r then
+                            out[#out + 1] = t
+                        end
+                    end
+                end
+            end
+        end
     end
-    LM.ghosts = {}
-    LM.ghostT = 0
+    LM.near = out
+    if LM.nearI > #out then LM.nearI = 1 end
+end
+
+-- re-check a slice of the schematic every frame: mostly what's near the
+-- player (what you can see), plus a slow sweep over the rest (for #build)
+function LM.scanStep(now)
+    if not LM.schem then return end
+    LM.refreshNear(now)
+    -- the budget is per 60 FPS frame, so a high frame rate doesn't scan more per second
+    local elapsed = min(50, max(0, now - (LM.scanT or now - 16.7)))
+    LM.scanT = now
+    LM.scanCarry = (LM.scanCarry or 0) + max(20, S.litematicaScanPerFrame) * elapsed / 16.7
+    local budget = floor(LM.scanCarry)
+    LM.scanCarry = LM.scanCarry - budget
+    if budget <= 0 then return end
+    local near = LM.near
+    local nn = #near
+    local nearBudget = min(nn, floor(budget * 0.7))
+    for _ = 1, nearBudget do
+        if LM.nearI > nn then LM.nearI = 1 end
+        LM.check(near[LM.nearI])
+        LM.nearI = LM.nearI + 1
+    end
+    local all = LM.targets
+    local na = #all
+    for _ = 1, min(na, budget - nearBudget) do
+        if LM.scanI > na then LM.scanI = 1 end
+        LM.check(all[LM.scanI])
+        LM.scanI = LM.scanI + 1
+    end
+end
+
+-- block the player's crosshair is on, if it's part of the schematic
+function LM.lookAt()
+    if not LM.schem then return nil end
+    local ex, ey, ez = P.eye()
+    local yaw, pitch = P.yaw * RAD, P.pitch * RAD
+    local dx, dy, dz = -sin(yaw) * cos(pitch), -sin(pitch), cos(yaw) * cos(pitch)
+    local x, y, z = floor(ex), floor(ey), floor(ez)
+    local stepX, stepY, stepZ = dx >= 0 and 1 or -1, dy >= 0 and 1 or -1, dz >= 0 and 1 or -1
+    local function first(p, d)
+        if d == 0 then return INF end
+        local edge = (d > 0) and (floor(p) + 1) or floor(p)
+        return (edge - p) / d
+    end
+    local tMaxX, tMaxY, tMaxZ = first(ex, dx), first(ey, dy), first(ez, dz)
+    local tDX = dx ~= 0 and abs(1 / dx) or INF
+    local tDY = dy ~= 0 and abs(1 / dy) or INF
+    local tDZ = dz ~= 0 and abs(1 / dz) or INF
+    for _ = 1, 80 do
+        local k = U.key(x, y, z)
+        local want = LM.byKey[k]
+        if want and (LM.layer == nil or y == LM.layer) then
+            local t = { x, y, z, want, k }
+            local st, n = LM.cached(t)
+            if st ~= "ok" or not K.passable(n) then return t, st, n end
+        elseif not K.passable(W.get(x, y, z)) then
+            return nil
+        end
+        if tMaxX < tMaxY and tMaxX < tMaxZ then
+            if tMaxX > 24 then break end
+            x = x + stepX tMaxX = tMaxX + tDX
+        elseif tMaxY < tMaxZ then
+            if tMaxY > 24 then break end
+            y = y + stepY tMaxY = tMaxY + tDY
+        else
+            if tMaxZ > 24 then break end
+            z = z + stepZ tMaxZ = tMaxZ + tDZ
+        end
+    end
+    return nil
+end
+
+function LM.lookText(now)
+    if not LM.schem or not S.litematicaShowLooking then LM.look = nil return nil end
+    if now - LM.lookT >= 100 then
+        LM.lookT = now
+        local t, st, n = LM.lookAt()
+        if not t then
+            LM.look = nil
+        else
+            local txt
+            if st == "ok" then
+                txt = t[4] .. " (done)"
+            elseif st == "missing" then
+                txt = t[4] .. " (missing)"
+            else
+                txt = t[4] .. " (wrong: " .. tostring(n) .. " is there)"
+            end
+            LM.look = { t = t, text = txt }
+        end
+    end
+    return LM.look and LM.look.text or nil
 end
 
 function LM.set(schem, ox, oy, oz)
@@ -440,7 +577,7 @@ end
 
 function LM.unload()
     LM.schem = nil
-    LM.targets, LM.byKey, LM.buckets, LM.ghosts = {}, {}, {}, {}
+    LM.rebuild() -- clears everything
 end
 
 function LM.state(t)
@@ -456,41 +593,69 @@ function LM.state(t)
 end
 
 -- refresh the list of ghost boxes near the player (called a few times a second)
+-- ghost boxes near the player, from the cached states (no world reads here)
+-- each: { x, y, z, state, distance, blockName }
 function LM.updateGhosts(now)
-    if not LM.schem or now - LM.ghostT < 400 then return end
+    if not LM.schem then return end
+    LM.scanStep(now)
+    if now - LM.ghostT < 250 then return end
     LM.ghostT = now
-    local r = S.litematicaRenderRadius
-    local cx, cy, cz = P.fx, P.fy, P.fz
+    local cx, cy, cz = P.fx + 0.5, P.fy + 1.5, P.fz + 0.5
     local out = {}
-    local maxBoxes = S.litematicaMaxBoxes
-    local cr = r // 16 + 1
-    for bx = cx // 16 - cr, cx // 16 + cr do
-        for bz = cz // 16 - cr, cz // 16 + cr do
-            local b = LM.buckets[U.key(bx, 0, bz)]
-            if b then
-                for _, t in ipairs(b) do
-                    if (LM.layer == nil or t[2] == LM.layer) and abs(t[1] - cx) <= r and abs(t[3] - cz) <= r and abs(t[2] - cy) <= r then
-                        local st = LM.state(t)
-                        if st ~= "ok" then
-                            out[#out + 1] = { t[1], t[2], t[3], st, U.dist3(t[1], t[2], t[3], cx, cy, cz) }
-                        end
-                    end
-                end
+    local layer = LM.layer
+    local stat = LM.stat
+    for _, t in ipairs(LM.near) do
+        if layer == nil or t[2] == layer then
+            local st = stat[t[5]]
+            if st and st ~= "ok" and t[4] ~= "air" or st == "wrong" then
+                local dx, dy, dz = t[1] + 0.5 - cx, t[2] + 0.5 - cy, t[3] + 0.5 - cz
+                out[#out + 1] = { t[1], t[2], t[3], st, dx * dx + dy * dy + dz * dz, t[4] }
             end
         end
     end
-    tsort(out, function(a, b) return a[5] < b[5] end)
-    while #out > maxBoxes do out[#out] = nil end
+    local maxBoxes = max(1, S.litematicaMaxBoxes)
+    if #out > maxBoxes then
+        -- keep the nearest: bucket by squared distance (a counting sort, no table.sort)
+        local rings, top = {}, 0
+        for _, g in ipairs(out) do
+            local ring = floor(g[5])
+            local list = rings[ring]
+            if not list then list = {} rings[ring] = list end
+            list[#list + 1] = g
+            if ring > top then top = ring end
+        end
+        local kept = {}
+        for ring = 0, top do
+            local list = rings[ring]
+            if list then
+                for _, g in ipairs(list) do
+                    kept[#kept + 1] = g
+                    if #kept >= maxBoxes then break end
+                end
+                if #kept >= maxBoxes then break end
+            end
+        end
+        out = kept
+    end
     LM.ghosts = out
 end
 
-function LM.verify()
-    local ok, missing, wrong = 0, 0, 0
+-- counts from the cache; anything never checked is checked now (up to a budget)
+function LM.verify(budget)
+    local ok, missing, wrong, unknown = 0, 0, 0, 0
+    budget = budget or 20000
     for _, t in ipairs(LM.targets) do
-        local st = LM.state(t)
-        if st == "ok" then ok = ok + 1 elseif st == "missing" then missing = missing + 1 else wrong = wrong + 1 end
+        local st = LM.stat[t[5]]
+        if not st and budget > 0 then
+            budget = budget - 1
+            st = LM.check(t)
+        end
+        if st == "ok" then ok = ok + 1
+        elseif st == "missing" then missing = missing + 1
+        elseif st == "wrong" then wrong = wrong + 1
+        else unknown = unknown + 1 end
     end
-    return ok, missing, wrong
+    return ok, missing, wrong, unknown
 end
 
 -- =====================================================================
@@ -529,16 +694,22 @@ function Proc.build()
         local missingItems = {}
         local anyIncomplete = false
         local startLayer = S.buildInLayers and (self.layer or LM.minY) or LM.minY
+        local fresh = 400 -- blocks we may read from the world this pick (the rest comes from the cache)
+        local itemFor = {} -- block name -> item, or false if it's not in the hotbar
+        local KEEP = 24    -- only the nearest few candidates matter
         for layer = startLayer, LM.maxY do
-            local i0 = LM.layerStart[layer]
-            if i0 then
-                local cands = {}
+            local list = LM.layers[layer]
+            if list then
+                local cands = {} -- sorted by distance, at most KEEP long
                 local layerIncomplete = false
                 local blocked = false
-                local i = i0
-                while LM.targets[i] and LM.targets[i][2] == layer do
-                    local t = LM.targets[i]
-                    local st, n = LM.state(t)
+                for _, t in ipairs(list) do
+                    local st, n = LM.stat[t[5]], LM.cur[t[5]]
+                    if not st then
+                        if fresh <= 0 then return nil end -- still scanning; carry on next pick
+                        fresh = fresh - 1
+                        st, n = LM.check(t)
+                    end
                     if st ~= "ok" then
                         layerIncomplete = true
                         local sk = self.skip[t[5]]
@@ -546,28 +717,54 @@ function Proc.build()
                         if not sk or sk < now then
                             local act
                             if st == "missing" then
-                                local item = K.itemForBlock(t[4])
-                                if not HB.has(item) then
-                                    missingItems[item] = true
-                                elseif PF.hasSupport(t[1], t[2], t[3]) then
-                                    act = "place"
+                                local item = itemFor[t[4]]
+                                if item == nil then
+                                    local it = K.itemForBlock(t[4])
+                                    item = HB.has(it) and it or false
+                                    itemFor[t[4]] = item
+                                    if not item then missingItems[it] = true end
                                 end
+                                if item then act = "place" end
                             elseif st == "wrong" and (S.buildBreakWrong or t[4] == "air") and not K.unbreakable(n) then
                                 act = "break"
                             end
                             if act then
-                                cands[#cands + 1] = { t = t, act = act, d = U.dist3(ex, ey, ez, t[1] + 0.5, t[2] + 0.5, t[3] + 0.5) }
+                                local dx, dy, dz = t[1] + 0.5 - ex, t[2] + 0.5 - ey, t[3] + 0.5 - ez
+                                local d = dx * dx + dy * dy + dz * dz
+                                local nc = #cands
+                                if (nc < KEEP or d < cands[nc].d2)
+                                    and (act ~= "place" or PF.hasSupport(t[1], t[2], t[3])) then
+                                    local pos = nc + 1
+                                    while pos > 1 and cands[pos - 1].d2 > d do
+                                        cands[pos] = cands[pos - 1]
+                                        pos = pos - 1
+                                    end
+                                    cands[pos] = { t = t, act = act, d2 = d, d = sqrt(d) }
+                                    if #cands > KEEP then cands[#cands] = nil end
+                                end
                             end
                         end
                     end
-                    i = i + 1
                 end
                 if #cands > 0 then
-                    tsort(cands, function(a, b) return a.d < b.d end)
+                    -- the cache can be a moment old: confirm with a fresh read before committing
+                    local j = 1
+                    local checked = 0
+                    while cands[j] and checked < 32 do
+                        local c = cands[j]
+                        local st = LM.check(c.t)
+                        checked = checked + 1
+                        if (c.act == "place" and st ~= "missing") or (c.act == "break" and st ~= "wrong") then
+                            table.remove(cands, j)
+                        else
+                            j = j + 1
+                        end
+                    end
+                    if #cands == 0 then return nil end
                     -- prefer something we can do without moving
-                    for j = 1, min(#cands, 24) do
-                        if cands[j].d <= S.buildReach + 0.5 and self:canActFromHere(cands[j].t, cands[j].act) then
-                            return cands[j].t, cands[j].act, true
+                    for k = 1, min(#cands, 24) do
+                        if cands[k].d <= S.buildReach + 0.5 and self:canActFromHere(cands[k].t, cands[k].act) then
+                            return cands[k].t, cands[k].act, true
                         end
                     end
                     return cands[1].t, cands[1].act, false
@@ -621,6 +818,7 @@ function Proc.build()
             else
                 failTarget(t, now)
             end
+            LM.check(t)
             LM.ghostT = 0
             self.phase = "choose"
             return true
@@ -648,7 +846,12 @@ function Proc.build()
             end
         end
         if self.phase == "choose" then
+            if self.nextPick and now < self.nextPick then
+                IN.clear()
+                return true
+            end
             local t, act, here = self:pick(now)
+            self.nextPick = (t == nil) and (now + 300) or nil
             if t == "done" then
                 Bot.finish(fmt("Build complete (%d placed, %d broken)", self.placed, self.broken))
                 return true

@@ -72,8 +72,14 @@ end
 
 function IN.rawPending() return #IN.rawQueue > 0 end
 
+function IN.rotMode()
+    local m = tostring(S.rotationMode):lower()
+    if m == "turn" or m == "mouse" then return m end
+    return "set"
+end
+
 function IN.turnMode()
-    return NATIVE and S.rotationMode == "turn"
+    return NATIVE and IN.rotMode() ~= "set"
 end
 
 function IN.calibrated()
@@ -132,7 +138,169 @@ end
 -- Native (DLL) output: movement through the game's input state, rotation
 -- written directly (or through the game's mouse-look), clicks / hotbar keys
 -- ------------------------------------------------------------------
-IN.nat = { rmbSent = 0, slotSent = 0, lastActive = false, setFails = 0, lastSetYaw = nil, lastSetPrevYaw = nil }
+IN.nat = { rmbSent = 0, slotSent = 0, lastActive = false, setFails = 0, lastSetYaw = nil, lastSetPrevYaw = nil,
+    autoMode = "hook", sentMode = nil, sentKeys = nil, syncT = -1e9, stats = nil, statsT = -1e9,
+    mv = nil, hookMoved = false, keysMoved = false, warnedStuck = false, yawWin = nil, yawBad = 0, fracX = 0, fracY = 0 }
+
+-- Windows virtual-key codes for the key settings (used by the "keys" input mode)
+IN.VK_NAMES = { SPACE = 0x20, LSHIFT = 0xA0, RSHIFT = 0xA1, SHIFT = 0x10, LCONTROL = 0xA2, LCTRL = 0xA2,
+    RCONTROL = 0xA3, RCTRL = 0xA3, CONTROL = 0x11, CTRL = 0x11, TAB = 0x09, CAPSLOCK = 0x14, CAPITAL = 0x14,
+    LALT = 0xA4, LMENU = 0xA4, RALT = 0xA5, ALT = 0x12, UP = 0x26, DOWN = 0x28, LEFT = 0x25, RIGHT = 0x27,
+    ENTER = 0x0D, RETURN = 0x0D }
+
+function IN.vk(name)
+    local s = tostring(name or ""):upper():gsub("^KEY_", ""):gsub("%s", "")
+    if #s == 1 then
+        local b = s:byte()
+        if (b >= 65 and b <= 90) or (b >= 48 and b <= 57) then return b end
+    end
+    if IN.VK_NAMES[s] then return IN.VK_NAMES[s] end
+    local f = tonumber(s:match("^F(%d+)$") or "")
+    if f and f >= 1 and f <= 24 then return 0x6F + f end
+    return nil
+end
+
+-- diagnostics from the DLL (hook ages, focus, dead signatures ...)
+function IN.stats(now)
+    local nat = IN.nat
+    now = now or U.now()
+    if now - nat.statsT >= 250 then
+        nat.statsT = now
+        local ok, st = pcall(native.stats)
+        nat.stats = (ok and type(st) == "table") and st or nil
+    end
+    return nat.stats
+end
+
+function IN.inputMode()
+    local m = tostring(S.inputMode):lower()
+    if m == "hook" or m == "keys" then return m end
+    return IN.nat.autoMode
+end
+
+-- tell the DLL which input mode and movement keys to use (when they change)
+function IN.syncNative(now, force)
+    local nat = IN.nat
+    if not force and now - nat.syncT < 250 then return end
+    nat.syncT = now
+    local mode = IN.inputMode()
+    if mode ~= nat.sentMode then
+        nat.sentMode = mode
+        pcall(native.setInputMode, mode)
+    end
+    local keys = {}
+    for i, k in ipairs({ "keyForward", "keyBack", "keyLeft", "keyRight", "keyJump", "keySneak", "keySprint" }) do
+        keys[i] = IN.vk(S[k]) or 0
+    end
+    local sig = tconcat(keys, ",")
+    if sig ~= nat.sentKeys then
+        nat.sentKeys = sig
+        pcall(native.setMoveKeys, table.unpack(keys))
+    end
+end
+
+-- 'auto' input mode: if the player doesn't move while the bot holds a
+-- movement key, the game ignored the hook - press the real keys instead
+function IN.checkMovement(now, active)
+    local nat = IN.nat
+    local h = IN.hold
+    local wants = active and (h.forward or h.back or h.left or h.right)
+    if not wants or not Helper.focus or not P.inHud() then nat.mv = nil return end
+    local mode = IN.inputMode()
+    local mv = nat.mv
+    if not mv or mv.mode ~= mode then
+        nat.mv = { t = now, x = P.x, z = P.z, mode = mode }
+        return
+    end
+    if U.dist2(P.x, P.z, mv.x, mv.z) > 0.3 then
+        if mode == "hook" then nat.hookMoved = true else nat.keysMoved = true end
+        nat.mv = { t = now, x = P.x, z = P.z, mode = mode }
+        return
+    end
+    local stuckFor = now - mv.t
+    local st = IN.stats(now)
+    local hookDead = st ~= nil and st.moveAge ~= nil and (st.moveAge < 0 or st.moveAge > 1000)
+    if tostring(S.inputMode):lower() == "auto" and mode == "hook" and not nat.hookMoved
+        and ((hookDead and stuckFor > 300) or stuckFor > 1500) then
+        nat.autoMode = "keys"
+        nat.mv = nil
+        IN.syncNative(now, true)
+        U.chat("\194\167eThe game isn't taking the bot's movement - switching to pressing your movement keys"
+            .. " (" .. tostring(S.keyForward) .. tostring(S.keyLeft) .. tostring(S.keyBack) .. tostring(S.keyRight)
+            .. ", " .. tostring(S.keyJump) .. ", " .. tostring(S.keySneak) .. ", " .. tostring(S.keySprint) .. ").")
+    elseif mode == "keys" and not nat.keysMoved and stuckFor > 4000 and not nat.warnedStuck then
+        nat.warnedStuck = true
+        U.chat("\194\167cI can't move you. Type " .. S.prefix .. "debug and send the developer what it says.")
+    end
+end
+
+function IN.switchRotation(reason)
+    local st = IN.stats()
+    local cur = IN.rotMode()
+    local nxt
+    if cur == "set" then
+        nxt = (st and st.deadTurn) and "mouse" or "turn"
+    elseif cur == "turn" then
+        nxt = "mouse"
+    else
+        return false
+    end
+    S.rotationMode = nxt
+    S.mouseYawPerPixel, S.mousePitchPerPixel = 0, 0
+    Settings.save()
+    U.chat("\194\167e" .. reason .. " - switching to " .. (nxt == "turn" and "the game's mouse-look" or "real mouse movement")
+        .. " for turning (calibrating, don't touch the mouse).")
+    IN.nat.fracX, IN.nat.fracY = 0, 0
+    if Bot.makeCalibrate then Bot.queuePre(Bot.makeCalibrate()) end
+    return true
+end
+
+-- if the bot walks forward but the player moves in a different direction from
+-- where the bot thinks it's looking, the rotation write isn't reaching the game
+function IN.checkYaw(now, active)
+    local nat = IN.nat
+    local h = IN.hold
+    if not active or not h.forward or h.back or h.left or h.right or not P.grounded or IN.rotMode() ~= "set" then
+        nat.yawWin = nil
+        return
+    end
+    local w = nat.yawWin
+    local turned = w and U.wrap180(P.yaw - w.yaw) or 0
+    if not w or abs(turned) > 30 then
+        nat.yawWin = { t = now, x = P.x, z = P.z, yaw = P.yaw }
+        return
+    end
+    if now - w.t < 350 then return end
+    local d = U.dist2(P.x, P.z, w.x, w.z)
+    if d > 0.5 then
+        local moveYaw = U.yawTo(w.x, w.z, P.x, P.z)
+        local meanYaw = w.yaw + turned / 2
+        if abs(U.wrap180(moveYaw - meanYaw)) > 50 then
+            nat.yawBad = nat.yawBad + 1
+        else
+            nat.yawBad = max(0, nat.yawBad - 1)
+        end
+        if nat.yawBad >= 4 then
+            nat.yawBad = 0
+            IN.switchRotation("You're not walking the way the bot is looking")
+        end
+    end
+    nat.yawWin = { t = now, x = P.x, z = P.z, yaw = P.yaw }
+end
+
+-- turn by a calibrated amount: the game's mouse-look ("turn") or the real mouse ("mouse")
+function IN.turnRaw(dx, dy)
+    local nat = IN.nat
+    if IN.rotMode() == "mouse" then
+        nat.fracX, nat.fracY = nat.fracX + dx, nat.fracY + dy
+        local ix = nat.fracX >= 0 and floor(nat.fracX) or ceil(nat.fracX)
+        local iy = nat.fracY >= 0 and floor(nat.fracY) or ceil(nat.fracY)
+        nat.fracX, nat.fracY = nat.fracX - ix, nat.fracY - iy
+        if ix ~= 0 or iy ~= 0 then pcall(native.mouseMove, U.clamp(ix, -400, 400), U.clamp(iy, -400, 400)) end
+    else
+        pcall(native.turn, dx, dy)
+    end
+end
 
 function IN.nativeRotate(now, dt, active)
     local nat = IN.nat
@@ -142,12 +310,9 @@ function IN.nativeRotate(now, dt, active)
         local wanted = abs(U.wrap180(nat.lastSetYaw - nat.lastSetPrevYaw))
         if wanted > 0.5 and moved < 0.05 then
             nat.setFails = nat.setFails + 1
-            if nat.setFails >= 20 and S.rotationMode == "set" then
-                S.rotationMode = "turn"
-                S.mouseYawPerPixel, S.mousePitchPerPixel = 0, 0
-                Settings.save()
-                U.chat("\194\167eDirect rotation doesn't work on this version - switching to mouse-look turning (calibrating).")
-                if Bot.makeCalibrate then Bot.queuePre(Bot.makeCalibrate()) end
+            if nat.setFails >= 20 and IN.rotMode() == "set" then
+                nat.setFails = 0
+                IN.switchRotation("Direct rotation doesn't work on this version")
             end
         elseif moved >= 0.05 then
             nat.setFails = 0
@@ -166,7 +331,7 @@ function IN.nativeRotate(now, dt, active)
     if sy == 0 and sp == 0 then return end
     if IN.turnMode() then
         if not IN.calibrated() then return end
-        pcall(native.turn, sy / S.mouseYawPerPixel, sp / S.mousePitchPerPixel)
+        IN.turnRaw(sy / S.mouseYawPerPixel, sp / S.mousePitchPerPixel)
     else
         local ny, np = U.wrap180(P.yaw + sy), U.clamp(P.pitch + sp, -89.9, 89.9)
         pcall(native.setRotation, np, ny)
@@ -176,11 +341,12 @@ end
 
 function IN.nativeFrame(now, dt, active)
     local nat = IN.nat
+    IN.syncNative(now)
     IN.nativeRotate(now, dt, active)
-    -- calibration moves (turn mode only)
+    -- calibration moves (turn / mouse modes)
     if #IN.rawQueue > 0 then
         local st = tremove(IN.rawQueue, 1)
-        pcall(native.turn, st[1], st[2])
+        IN.turnRaw(st[1], st[2])
     end
     if active then
         local h = IN.hold
@@ -203,6 +369,8 @@ function IN.nativeFrame(now, dt, active)
             pcall(native.setButtons, false, false)
         end
     end
+    IN.checkMovement(now, active)
+    IN.checkYaw(now, active)
     nat.lastActive = active
     IN.active = active
 end

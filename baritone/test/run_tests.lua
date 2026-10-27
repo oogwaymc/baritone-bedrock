@@ -583,7 +583,7 @@ if SIM.nativeMode then
         end)
         SIM.nativeRotationWorks = true
         assert(ok, err)
-        assertTrue(SIM.chatContains("switching to mouse-look"), "no fallback message: " .. SIM.lastChat(3))
+        assertTrue(SIM.chatContains("mouse-look for turning"), "no fallback message: " .. SIM.lastChat(3))
         assertTrue(SIM.chatContains("Mouse calibrated"), "did not calibrate: " .. SIM.lastChat(3))
         local x, y, z = feet()
         assertTrue(x == 15 and z == 9, string.format("ended at %d %d %d", x, y, z))
@@ -604,6 +604,138 @@ if SIM.nativeMode then
         setup({ hotbar = { [0] = { name = "iron_pickaxe" }, [5] = { name = "water_bucket" } } })
         SIM.command("#hotbar")
         assertTrue(SIM.chatContains("6:water_bucket"), SIM.lastChat(1))
+    end)
+
+    -- runs fn with some SIM flags changed, restoring them afterwards
+    local function withFlags(flags, fn)
+        local old = {}
+        for k, v in pairs(flags) do old[k] = SIM[k] SIM[k] = v end
+        local ok, err = pcall(fn)
+        for k in pairs(flags) do SIM[k] = old[k] end
+        assert(ok, err)
+    end
+
+    test("DLL: works when the game tick hook is dead", function()
+        withFlags({ tickHookWorks = false }, function()
+            setup()
+            SIM.command("#goto 20 64 5")
+            SIM.run(30000, idleAfter)
+            local x, y, z = feet()
+            assertTrue(x == 20 and z == 5, string.format("ended at %d %d %d", x, y, z))
+            SIM.command("#debug")
+            assertTrue(SIM.chatContains("bot ticks from: frame"), "debug output: " .. SIM.lastChat(6))
+        end)
+    end)
+
+    test("DLL: switches to keys when the movement hook is dead", function()
+        withFlags({ moveHookFires = false }, function()
+            setup()
+            SIM.command("#goto 20 64 5")
+            SIM.run(30000, idleAfter)
+            assertTrue(SIM.chatContains("switching to pressing your movement keys"), "no switch: " .. SIM.lastChat(3))
+            assertTrue(SIM.inputMode == "keys", "input mode " .. tostring(SIM.inputMode))
+            local x, y, z = feet()
+            assertTrue(x == 20 and z == 5, string.format("ended at %d %d %d", x, y, z))
+            assertTrue(SIM.moveKeys and SIM.moveKeys[1] == 87 and SIM.moveKeys[5] == 0x20 and SIM.moveKeys[7] == 0xA2,
+                "move keys not sent")
+        end)
+    end)
+
+    test("DLL: switches to keys when the game ignores the hook", function()
+        withFlags({ moveHookWorks = false }, function()
+            setup()
+            SIM.command("#goto 20 64 5")
+            SIM.run(30000, idleAfter)
+            assertTrue(SIM.chatContains("switching to pressing your movement keys"), "no switch: " .. SIM.lastChat(3))
+            local x, y, z = feet()
+            assertTrue(x == 20 and z == 5, string.format("ended at %d %d %d", x, y, z))
+        end)
+    end)
+
+    test("DLL: hook that works is kept (no false switch)", function()
+        setup()
+        -- walk into a wall-free path, then get blocked briefly: must stay on the hook
+        SIM.command("#goto 25 64 0")
+        SIM.run(30000, idleAfter)
+        assertTrue(not SIM.chatContains("switching to pressing"), "switched for no reason")
+        assertTrue(SIM.inputMode == "hook", "mode " .. tostring(SIM.inputMode))
+    end)
+
+    test("DLL: notices rotation that doesn't reach the camera", function()
+        withFlags({ rotationCosmetic = true }, function()
+            setup({ calibrated = false })
+            SIM.command("#goto 30 64 12")
+            SIM.run(60000, idleAfter)
+            assertTrue(SIM.chatContains("not walking the way"), "no rotation switch: " .. SIM.lastChat(4))
+            assertTrue(SIM.chatContains("Mouse calibrated"), "did not calibrate: " .. SIM.lastChat(3))
+            local x, y, z = feet()
+            assertTrue(x == 30 and z == 12, string.format("ended at %d %d %d", x, y, z))
+        end)
+    end)
+
+    test("DLL: ghost blocks are tinted with their block colour + HUD look-at", function()
+        local pal = { "minecraft:air", "minecraft:oak_planks", "minecraft:red_wool" }
+        local bin = NB.makeLitematic({ { name = "L", pos = { 0, 0, 0 }, size = { 3, 2, 3 }, palette = pal,
+            fn = function(x, y, z) if y == 1 then return 2 end return 1 end } })
+        setup({ files = { ["Baritone/schematics/g.litematic"] = bin } })
+        SIM.command("#lm load g 2 64 0")
+        SIM.run(1500)
+        assertTrue(SIM.boxes3d >= 18, "ghost boxes: " .. tostring(SIM.boxes3d))
+        local E = BARITONE_EXPOSE
+        local plank = E.K.blockColor("oak_planks")
+        local wool = E.K.blockColor("red_wool")
+        assertTrue(plank[1] ~= wool[1] or plank[2] ~= wool[2], "colours should differ")
+        local sawPlank, sawWool, filled = false, false, false
+        local d = SIM.boxData
+        for i = 1, #d, 11 do
+            if d[i + 6] == plank[1] and d[i + 7] == plank[2] and d[i + 8] == plank[3] then sawPlank = true end
+            if d[i + 6] == wool[1] and d[i + 7] == wool[2] and d[i + 8] == wool[3] then sawWool = true end
+            if d[i + 10] > 0 then filled = true end
+        end
+        assertTrue(sawPlank and sawWool and filled, "ghost colours not sent")
+        -- look at the ghost block in front: (2,64,0) is oak_planks, missing
+        SIM.player.x, SIM.player.y, SIM.player.z = 0.5, 64, 0.5
+        SIM.player.yaw, SIM.player.pitch = -90, 30
+        SIM.run(500)
+        assertTrue(SIM.status and SIM.status:find("Schematic: oak_planks (missing)", 1, true), "HUD: " .. tostring(SIM.status))
+    end)
+
+    test("DLL: big schematic stays fast", function()
+        local pal = { "minecraft:air", "minecraft:stone", "minecraft:glass", "minecraft:oak_planks" }
+        local bin = NB.makeLitematic({ { name = "L", pos = { 0, 0, 0 }, size = { 48, 24, 48 }, palette = pal,
+            fn = function(x, y, z) return 1 + (x + y + z) % 3 end } })
+        setup({ files = { ["Baritone/schematics/big.litematic"] = bin }, hotbar = { [0] = { name = "iron_pickaxe" },
+            [1] = { name = "stone", count = 64 }, [2] = { name = "glass", count = 64 }, [3] = { name = "oak_planks", count = 64 } } })
+        SIM.command("#lm load big 3 64 3")
+        SIM.run(8000, function() return SIM.chatContains("Loaded big") end)
+        assertTrue(SIM.chatContains("Loaded big"), "not loaded: " .. SIM.lastChat(2))
+        SIM.command("#lm build")
+        -- worst frame while building (CPU time spent in the script per frame)
+        local worst, total, frames = 0, 0, 0
+        local frameFn = SIM.events.SetupAndRenderEvent
+        local tickFn = SIM.events.TickEvent
+        SIM.events.SetupAndRenderEvent = function()
+            local t0 = os.clock()
+            frameFn()
+            local dt = os.clock() - t0
+            worst = math.max(worst, dt)
+            total, frames = total + dt, frames + 1
+        end
+        SIM.events.TickEvent = function()
+            local t0 = os.clock()
+            tickFn()
+            local dt = os.clock() - t0
+            worst = math.max(worst, dt)
+            total = total + dt
+        end
+        SIM.run(20000)
+        SIM.events.SetupAndRenderEvent, SIM.events.TickEvent = frameFn, tickFn
+        local avg = total / math.max(1, frames)
+        print(string.format("      big schematic: %d blocks, worst %.1f ms, avg %.2f ms per frame, placed %d",
+            #BARITONE_EXPOSE.LM.targets, worst * 1000, avg * 1000, SIM.placed))
+        assertTrue(SIM.placed > 10, "didn't build: placed " .. SIM.placed .. " " .. SIM.lastChat(3))
+        assertTrue(worst < 0.060, string.format("a frame took %.1f ms", worst * 1000))
+        assertTrue(avg < 0.004, string.format("average %.2f ms per frame", avg * 1000))
     end)
 end
 

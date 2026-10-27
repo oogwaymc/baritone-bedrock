@@ -16,6 +16,9 @@
 #include <vector>
 
 struct lua_State;
+namespace SDK {
+    struct MoveInputComponent;
+}
 
 class BaritoneModule : public TextModule {
 public:
@@ -39,6 +42,14 @@ public:
         float r, g, b, a;
     };
 
+    // a ghost block / target box: outline colour + optional translucent fill
+    struct Box {
+        float x1, y1, z1, x2, y2, z2;
+        float r, g, b, a, fill;
+    };
+
+    enum class InputMode { Hook, Keys };
+
     std::mutex stateMutex; // guards the fields below
     MoveState move;
     bool lmbWanted = false;
@@ -50,10 +61,17 @@ public:
     bool hasTurn = false;
     float turnX = 0.f, turnY = 0.f;
     std::vector<Line> lines;
+    std::vector<Box> boxes;
+    InputMode inputMode = InputMode::Hook;
+    unsigned short moveKeys[7] = { 'W', 'S', 'A', 'D', VK_SPACE, VK_LSHIFT, VK_LCONTROL };
     std::wstring statusText;
     bool statusVisible = false;
 
     std::atomic<int> panicCount { 0 };
+
+    // diagnostics: when the game's hooks last fired (ms since injection, -1 = never)
+    std::atomic<long long> lastTickMs { -1 };
+    std::atomic<long long> lastMoveMs { -1 };
 
     bool isGameFocused();
     bool isInHud();
@@ -66,6 +84,8 @@ private:
     void onRenderLevel(Event& ev);
     void onChat(Event& ev);
     void onAfterMove(Event& ev);
+    void onBeforeMove(Event& ev);
+    void writeMoveInput(SDK::MoveInputComponent* input, bool before);
     void onKey(Event& ev);
     void onLeaveGame(Event& ev);
 
@@ -86,6 +106,8 @@ private:
     bool sentLmb = false, sentRmb = false;
     bool tapLeft = false, tapRight = false;
     unsigned short heldSlotKey = 0;
+    unsigned short keysDown[7] = {}; // virtual-key codes we're holding (keys input mode)
+    void releaseMoveKeys();
 
     ValueType stopKey = KeyValue('X');
     ValueType showStatus = BoolValue(true);

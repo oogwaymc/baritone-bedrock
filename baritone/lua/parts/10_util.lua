@@ -17,9 +17,25 @@ function U.now()
     return os.clock() * 1000
 end
 
--- "minecraft:Stone[foo=bar]" -> "stone"
+-- diagnostics shared by the main loop and #debug
+local DBG = { tickSource = "game", realTickT = nil, frames = 0 }
+
+-- "minecraft:Stone[foo=bar]" -> "stone"  (memoized: block names repeat constantly)
+local BARE, BARE_N = {}, 0
 function U.bare(n)
     if n == nil then return "air" end
+    local hit = BARE[n]
+    if hit then return hit end
+    local orig = n
+    n = U.bareRaw(n)
+    if BARE_N < 50000 then
+        BARE[orig] = n
+        BARE_N = BARE_N + 1
+    end
+    return n
+end
+
+function U.bareRaw(n)
     n = tostring(n)
     local b = n:find("[", 1, true)
     if b then n = n:sub(1, b - 1) end

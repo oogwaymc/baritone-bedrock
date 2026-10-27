@@ -80,7 +80,7 @@ client = {
 }
 player = {
     position = function() local p = P() return p.x, p.y, p.z end,
-    rotation = function() local p = P() return { x = p.pitch, y = p.yaw } end,
+    rotation = function() local p = P() return { x = p.fakePitch or p.pitch, y = p.fakeYaw or p.yaw } end,
     velocity = function() local p = P() return p.vx, p.vy, p.vz end,
     grounded = function() return P().grounded end,
     health = function() return P().health end,
@@ -499,23 +499,55 @@ function SIM.installNative()
     SIM.status = nil
     SIM.lines3d = 0
     SIM.nativeRotationWorks = (SIM.nativeRotationWorks ~= false)
+    -- what works on the simulated game version (tests switch these off)
+    SIM.tickHookWorks = (SIM.tickHookWorks ~= false)   -- TickEvent fires
+    SIM.moveHookFires = (SIM.moveHookFires ~= false)   -- AfterMoveEvent fires
+    SIM.moveHookWorks = (SIM.moveHookWorks ~= false)   -- ... and the game uses what we write
+    SIM.inputMode = "hook"
+    SIM.boxes3d, SIM.boxData = 0, {}
     native = {
         version = "sim",
         setInput = function(active, f, b, l, r, j, s, sp)
             if not active then SIM.keys = {} SIM.lmb = false return end
+            local works = (SIM.inputMode == "keys") or (SIM.moveHookFires and SIM.moveHookWorks)
+            if not works then SIM.keys = {} return end
             SIM.keys = { W = f or nil, S = b or nil, A = l or nil, D = r or nil, SPACE = j or nil, LSHIFT = s or nil,
                 LCONTROL = sp or nil }
+        end,
+        setInputMode = function(m) SIM.inputMode = m end,
+        setMoveKeys = function(...) SIM.moveKeys = { ... } end,
+        mouseMove = function(dx, dy)
+            local pl = SIM.player
+            pl.fakeYaw, pl.fakePitch = nil, nil
+            SIM.mouseMoves = (SIM.mouseMoves or 0) + 1
+            pl.yaw = (pl.yaw + dx * SIM.degPerPx + 180) % 360 - 180
+            pl.pitch = math.max(-90, math.min(90, pl.pitch + dy * SIM.pitchPerPx))
+            return true
+        end,
+        setBoxes = function(t) SIM.boxes3d = #t // 11 SIM.boxData = t end,
+        stats = function()
+            return { tickAge = SIM.tickHookWorks and 10 or -1, moveAge = SIM.moveHookFires and 10 or -1, focused = true,
+                inHud = true, cursorGrabbed = true, latiteMenu = false, deadTick = not SIM.tickHookWorks,
+                deadMove = not SIM.moveHookFires, deadTurn = false, deadMouse = false, inputMode = SIM.inputMode,
+                lines = SIM.lines3d, boxes = SIM.boxes3d, moveActive = true, rotationComponent = true }
         end,
         setButtons = function(lmb, rmb) SIM.lmb = lmb == true end,
         click = function(b) if b == 2 then SIM.rightClick() end end,
         selectSlot = function(s) SIM.player.sel = s end,
         setRotation = function(pitch, yaw)
             if not SIM.nativeRotationWorks then return end
+            if SIM.rotationCosmetic then
+                -- the write is read back, but the camera / movement don't use it
+                SIM.player.fakePitch = math.max(-89.9, math.min(89.9, pitch))
+                SIM.player.fakeYaw = (yaw + 180) % 360 - 180
+                return
+            end
             SIM.player.pitch = math.max(-89.9, math.min(89.9, pitch))
             SIM.player.yaw = (yaw + 180) % 360 - 180
         end,
         turn = function(dx, dy)
             local pl = SIM.player
+            pl.fakeYaw, pl.fakePitch = nil, nil
             pl.yaw = (pl.yaw + dx * SIM.degPerPx + 180) % 360 - 180
             pl.pitch = math.max(-90, math.min(90, pl.pitch + dy * SIM.pitchPerPx))
             return true
@@ -577,7 +609,7 @@ function SIM.run(ms, untilFn)
             SIM.physics()
             SIM.blockActions()
             if SIM.entityTick then SIM.entityTick() end
-            if SIM.events.TickEvent then SIM.events.TickEvent() end
+            if SIM.events.TickEvent and (not SIM.nativeMode or SIM.tickHookWorks) then SIM.events.TickEvent() end
             SIM.nextTick = SIM.nextTick + 50
         end
         if SIM.events.SetupAndRenderEvent then SIM.events.SetupAndRenderEvent() end

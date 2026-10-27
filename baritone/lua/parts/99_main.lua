@@ -28,13 +28,23 @@ function Main.frame()
     if dt < 0 then dt = 0 end
     Main.lastFrame = now
     Main.init()
+    DBG.frames = DBG.frames + 1
     Helper.poll(now)
     P.refresh()
     REN.px, REN.py, REN.pz = P.x, P.y, P.z
     if not P.valid then
         IN.frame(now, dt, false)
-        if NATIVE then pcall(native.setLines, {}) pcall(native.setStatus, "", false) end
+        if NATIVE then pcall(native.setLines, {}) pcall(native.setBoxes, {}) pcall(native.setStatus, "", false) end
         return
+    end
+    -- the bot logic runs on the game tick; if that hook isn't firing on this
+    -- game version, run it from the frame loop at 20 per second instead
+    if not DBG.realTickT or now - DBG.realTickT > 250 then
+        if now - (Main.synthT or 0) >= 50 then
+            Main.synthT = now
+            DBG.tickSource = "frame"
+            Main.tick()
+        end
     end
     W.updateDimension()
     NAV.frame(now)
@@ -81,6 +91,8 @@ onEvent("SetupAndRenderEvent", function()
 end)
 
 onEvent("TickEvent", function()
+    DBG.realTickT = U.now()
+    DBG.tickSource = "game"
     safe(Main.tick)
 end)
 
@@ -177,5 +189,5 @@ end
 
 -- test hook (only used by the offline simulator)
 if rawget(_G, "BARITONE_EXPOSE") then
-    BARITONE_EXPOSE = { NAV = NAV, Bot = Bot, P = P, W = W, LM = LM, HB = HB, IN = IN, S = S, PF = PF, K = K, G = G, ACT = ACT, U = U }
+    BARITONE_EXPOSE = { NAV = NAV, Bot = Bot, P = P, W = W, LM = LM, HB = HB, IN = IN, S = S, PF = PF, K = K, G = G, ACT = ACT, U = U, REN = REN, CMD = CMD, DBG = DBG }
 end

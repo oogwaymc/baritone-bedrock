@@ -137,8 +137,16 @@ local function pushBox(t, x1, y1, z1, x2, y2, z2, c)
     pushLine(t, x2, y1, z2, x2, y2, z2, c) pushLine(t, x1, y1, z2, x1, y2, z2, c)
 end
 
+-- box with outline colour c (r,g,b,a) and fill alpha (0 = outline only)
+local function pushFilled(bx, x1, y1, z1, x2, y2, z2, c, fill)
+    local n = #bx
+    bx[n + 1], bx[n + 2], bx[n + 3], bx[n + 4], bx[n + 5], bx[n + 6] = x1, y1, z1, x2, y2, z2
+    bx[n + 7], bx[n + 8], bx[n + 9], bx[n + 10], bx[n + 11] = c[1], c[2], c[3], c[4] or 255, fill or 0
+end
+
+-- DLL renderer: lines (path) + boxes (goal, targets, ghost blocks)
 function REN.build3d()
-    local t = {}
+    local t, bx = {}, {}
     if S.renderPath and NAV.path and (NAV.state == "exec" or NAV.state == "plan") then
         local col = Settings.color("colorCurrentPath", 255)
         local done = Settings.color("colorCurrentPath", 90)
@@ -157,11 +165,11 @@ function REN.build3d()
         for i = 1, min(#list, 16) do
             local g = list[i]
             if g.kind == "block" or g.kind == "near" then
-                pushBox(t, g.x, g.y, g.z, g.x + 1, g.y + (g.kind == "near" and 1 or 2), g.z + 1, col)
+                pushFilled(bx, g.x, g.y, g.z, g.x + 1, g.y + (g.kind == "near" and 1 or 2), g.z + 1, col, 0)
             elseif g.kind == "xz" then
                 pushLine(t, g.x + 0.5, P.y - 30, g.z + 0.5, g.x + 0.5, P.y + 60, g.z + 0.5, col)
             elseif g.kind == "y" then
-                pushBox(t, P.x - 2, g.y, P.z - 2, P.x + 2, g.y + 0.02, P.z + 2, col)
+                pushFilled(bx, P.x - 2, g.y, P.z - 2, P.x + 2, g.y + 0.02, P.z + 2, col, 0)
             end
         end
     end
@@ -170,33 +178,55 @@ function REN.build3d()
         local n = 0
         for _, v in pairs(Bot.proc.known) do
             if abs(v[1] - P.x) < 32 and abs(v[3] - P.z) < 32 then
-                pushBox(t, v[1], v[2], v[3], v[1] + 1, v[2] + 1, v[3] + 1, col)
+                pushFilled(bx, v[1], v[2], v[3], v[1] + 1, v[2] + 1, v[3] + 1, col, 0)
                 n = n + 1
                 if n > 64 then break end
             end
         end
     end
     if S.litematicaRender and LM.schem then
-        local cMissing = { 90, 170, 255, 200 }
-        local cWrong = { 255, 60, 60, 230 }
+        -- ghost blocks: tinted with the colour of the block that goes there;
+        -- red outline = the wrong block is there
         local inset = 0.03
+        local fill = S.litematicaFill and 95 or 0
+        local wrongOutline = { 255, 40, 40, 255 }
+        local cur = Bot.proc and Bot.proc.name == "build" and Bot.proc.cur and Bot.proc.cur.t
         for _, gb in ipairs(LM.ghosts) do
-            pushBox(t, gb[1] + inset, gb[2] + inset, gb[3] + inset, gb[1] + 1 - inset, gb[2] + 1 - inset, gb[3] + 1 - inset,
-                (gb[4] == "missing") and cMissing or cWrong)
+            local c = K.blockColor(gb[6] or "stone")
+            local outline = (gb[4] == "wrong") and wrongOutline or { c[1], c[2], c[3], 235 }
+            pushFilled(bx, gb[1] + inset, gb[2] + inset, gb[3] + inset, gb[1] + 1 - inset, gb[2] + 1 - inset, gb[3] + 1 - inset,
+                outline, fill)
+        end
+        -- what the HUD is describing, and what the builder is working on
+        local look = LM.look and LM.look.t
+        if look then
+            pushFilled(bx, look[1] - 0.01, look[2] - 0.01, look[3] - 0.01, look[1] + 1.01, look[2] + 1.01, look[3] + 1.01,
+                { 255, 255, 255, 255 }, 0)
+        end
+        if cur then
+            pushFilled(bx, cur[1] - 0.02, cur[2] - 0.02, cur[3] - 0.02, cur[1] + 1.02, cur[2] + 1.02, cur[3] + 1.02,
+                { 255, 230, 60, 255 }, 0)
         end
         local sx, sy, sz = LM.size()
-        pushBox(t, LM.ox, LM.oy, LM.oz, LM.ox + sx, LM.oy + sy, LM.oz + sz, { 255, 255, 255, 120 })
+        pushFilled(bx, LM.ox, LM.oy, LM.oz, LM.ox + sx, LM.oy + sy, LM.oz + sz, { 255, 255, 255, 120 }, 0)
     end
-    return t
+    return t, bx
 end
 
 function REN.update3d(now)
+    local lookText = LM.lookText(now)
     if now >= REN.next3d then
         REN.next3d = now + 100
-        pcall(native.setLines, REN.build3d())
+        local lines, boxes = REN.build3d()
+        pcall(native.setLines, lines)
+        pcall(native.setBoxes, boxes)
     end
-    local visible = S.renderHud and (Bot.isActive() or Bot.paused)
-    local text = REN.status or ""
+    local active = Bot.isActive() or Bot.paused
+    local visible = S.renderHud and (active or lookText ~= nil)
+    local text = active and (REN.status or "") or ""
+    if lookText then
+        text = (text ~= "" and (text .. "  |  ") or "") .. "Schematic: " .. lookText
+    end
     if text ~= REN.lastStatus or visible ~= REN.lastVisible then
         REN.lastStatus, REN.lastVisible = text, visible
         pcall(native.setStatus, text, visible)

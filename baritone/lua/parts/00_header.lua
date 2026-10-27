@@ -25,8 +25,11 @@ description = "Baritone-style pathfinding bot. Type #help in chat. Needs Bariton
 author = "Bedrock Baritone"
 debug = false
 
-local VERSION = "1.1.0"
+local VERSION = "1.2.0"
 local DIR = "Baritone"
 -- true inside Baritone.dll: input, rotation, inventory and rendering are native
 local NATIVE = type(rawget(_G, "native")) == "table" and type(native.setInput) == "function"
 local Bot = {}          -- filled in later (forward declaration)
+
+-- lots of small short-lived tables: generational GC avoids long pauses (frame hitches)
+if NATIVE then pcall(collectgarbage, "generational") end

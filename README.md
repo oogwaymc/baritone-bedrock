@@ -22,7 +22,7 @@ The bot logic (A* pathfinder, mining, building, farming, elytra, settings) is Lu
 
 ## Install
 
-1. Download `Baritone.dll` (from the latest build's artifacts).
+1. Download `Baritone.dll` from the [latest release](https://github.com/oogwaymc/baritone-bedrock/releases/tag/latest).
 2. Start Minecraft (26.50 / 26.52).
 3. Inject `Baritone.dll` with any DLL injector, for example the one in [Latite's launcher](https://github.com/LatiteClient/Launcher) ("custom DLL"), Fate/Jiayi launcher, or Process Hacker.
    **Don't inject the official Latite at the same time.** This DLL is Latite plus the bot.
@@ -76,7 +76,7 @@ Drop a `Baritone.lua` there to override the built-in bot script (then `#reload`)
 
 ## Building
 
-GitHub Actions builds `Baritone.dll` on every push (`.github/workflows/build.yml`, MSVC + CMake + Ninja).
+GitHub Actions builds `Baritone.dll` on every push to `main` and attaches it to the `latest` release (`.github/workflows/build.yml`, MSVC + CMake + Ninja).
 Locally you need Visual Studio 2022/2026 with "Desktop development with C++", CMake and Ninja:
 
 ```

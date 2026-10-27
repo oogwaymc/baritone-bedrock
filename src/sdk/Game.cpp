@@ -26,6 +26,7 @@ static_assert(sizeof(ClientInterface) == 0x18);
 ClientInstance* ClientInstance::get() {
     static ClientInstance* cached = nullptr;
     if (cached) return cached;
+    if (!sigs::PlatformGameCore.address) return nullptr;  // signature not found (unsupported game version)
 
     void* winMain = *sigs::PlatformGameCore.as<void**>();
     if (!winMain) return nullptr;

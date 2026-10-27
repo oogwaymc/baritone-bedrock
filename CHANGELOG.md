@@ -2,6 +2,15 @@
 
 All notable changes to Baritone Bedrock. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.2.2
+
+Supports Minecraft Bedrock 26.52 (package 1.26.5203.0) only. **Minecraft Bedrock 26.60 (released 27 October 2026) is not supported yet**: its game functions and memory layout moved.
+
+### Fixed
+
+- **Crash when the game version isn't supported.** When the bot couldn't find the game functions it needs (as on 26.60), it logged "Initialisation failed" and then ran the full unload, which reads game memory through the addresses it had just failed to find, and Minecraft crashed. It now only undoes what it actually started, unloads, and Minecraft keeps running. 1.1.0 and earlier have the same crash.
+- A message box now says which Minecraft version is running and which one the bot is made for, and `log.txt` records both.
+
 ## 1.2.1
 
 Supports Minecraft Bedrock 26.52 (package 1.26.5203.0), like 1.2.0.

@@ -1,24 +1,53 @@
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <winver.h>
 
 #include <cstdint>
 #include <cstring>
 #include <format>
+#include <iterator>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "core/Bot.h"
 #include "core/Chat.h"
 #include "core/Log.h"
 #include "core/Paths.h"
+#include "core/Safe.h"
 #include "core/Security.h"
 #include "memory/Hooks.h"
 #include "memory/Signatures.h"
 #include "platform/WorldTracker.h"
 
+#pragma comment(lib, "version.lib")  // GetFileVersionInfoW
+
+// The game version the signatures and offsets were made for (sdk/Offsets.h)
+#define BARITONE_SUPPORTED_GAME "26.52 (1.26.5203.0)"
+
 namespace {
 
 HMODULE g_module = nullptr;
+
+// The game's version from Minecraft.Windows.exe's version resource ("1.26.5203.0"), empty if unknown.
+std::string gameVersion() {
+    wchar_t path[MAX_PATH * 2];
+    DWORD len = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
+    if (!len || len >= std::size(path)) return {};
+    DWORD ignored = 0;
+    DWORD size = GetFileVersionInfoSizeW(path, &ignored);
+    if (!size) return {};
+    std::vector<uint8_t> data(size);
+    if (!GetFileVersionInfoW(path, 0, size, data.data())) return {};
+    VS_FIXEDFILEINFO* info = nullptr;
+    UINT infoSize = 0;
+    if (!VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&info), &infoSize) || !info ||
+        infoSize < sizeof(VS_FIXEDFILEINFO)) {
+        return {};
+    }
+    return std::format("{}.{}.{}.{}", HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
+                       HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS));
+}
 
 // Named event so a dev tool can ask for an unload without typing in the game.
 std::wstring unloadEventName() {
@@ -120,14 +149,34 @@ DWORD WINAPI mainThread(LPVOID) {
     }
     if (otherCopy) logger::info("Another Baritone Bedrock was already loaded in this game: it was unloaded first");
 
-    bool started = sigs::resolveAll() && hooks::initialize() && Bot::get().start();
+    std::string version = gameVersion();
+    logger::info("Minecraft {} (this bot is made for {})", version.empty() ? "version unknown" : version, BARITONE_SUPPORTED_GAME);
+
+    bool resolved = sigs::resolveAll();
+    bool hooked = resolved && hooks::initialize();
+    bool started = hooked && Bot::get().start();
     if (!started) {
+        // Only undo what was done. With game functions missing, the full unload below reads game
+        // memory through addresses that were never found, which crashed the game (26.60 update).
         logger::error("Initialisation failed, unloading. Is the game version supported?");
-    } else {
-        logger::info("Ready. Type #help in the chat.");
-        if (otherCopy) chat::info("Replaced the Baritone Bedrock that was already loaded.");
-        while (!Bot::get().unloadRequested() && WaitForSingleObject(unloadEvent, 100) == WAIT_TIMEOUT) {
-        }
+        if (hooked) safe::run("unload", [] { Bot::get().stop(); });
+        hooks::shutdown();
+        logger::info("Unloaded.");
+        logger::shutdown();
+        std::wstring text = std::format(
+            L"Baritone Bedrock {} is made for Minecraft Bedrock {}, and this game is {}.\n\n"
+            L"It couldn't find the game functions it needs, so it unloaded without changing anything. "
+            L"Minecraft keeps running.\n\nIt needs an update for this version of Minecraft. Details in log.txt "
+            L"(%LOCALAPPDATA%\\BaritoneBedrock).",
+            L"" BARITONE_BEDROCK_VERSION, L"" BARITONE_SUPPORTED_GAME, version.empty() ? std::wstring(L"another version")
+                                                                                : std::wstring(version.begin(), version.end()));
+        MessageBoxW(nullptr, text.c_str(), L"Baritone Bedrock", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+        if (unloadEvent) CloseHandle(unloadEvent);
+        FreeLibraryAndExitThread(g_module, 0);
+    }
+    logger::info("Ready. Type #help in the chat.");
+    if (otherCopy) chat::info("Replaced the Baritone Bedrock that was already loaded.");
+    while (!Bot::get().unloadRequested() && WaitForSingleObject(unloadEvent, 100) == WAIT_TIMEOUT) {
     }
 
     logger::info("Unloading...");

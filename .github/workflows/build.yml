@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write # lets the build attach Baritone.dll to the repo's "latest" release
 
 jobs:
   build:
@@ -55,3 +55,12 @@ jobs:
             ${{ env.BUILD_DIR }}/Baritone.dll
             ${{ env.BUILD_DIR }}/Baritone.pdb
           if-no-files-found: error
+
+      - name: Attach Baritone.dll to the "latest" release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest > /dev/null 2>&1 || gh release create latest --target "$GITHUB_SHA" --title "Baritone.dll (latest build)" --notes "Inject Baritone.dll instead of Latite, join a world and type #help. Stop key: X."
+          gh release upload latest "$BUILD_DIR/Baritone.dll" --clobber

@@ -1,0 +1,85 @@
+#pragma once
+#include "../../Module.h"
+#include "client/misc/DiscordIpcClient.h"
+#include "client/misc/ServerDetection.h"
+
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+
+class ClientTextEvent;
+class PacketReceiveEvent;
+class SendPacketEvent;
+class UpdateEvent;
+
+class DiscordPresence final : public Module {
+public:
+    DiscordPresence();
+    ~DiscordPresence() override;
+
+    void onEnable() override;
+    void onDisable() override;
+
+private:
+    struct ServerPresence {
+        ServerDetection::ServerId server;
+        std::string_view name;
+        std::string_view logoKey;
+        std::string_view logoTooltip;
+        bool tracksHiveGame = false;
+    };
+
+    const std::array<ServerPresence, 4> knownServers = {
+        ServerPresence { ServerDetection::ServerId::Hive, "The Hive", "thehive", "The Hive Logo", true },
+        ServerPresence { ServerDetection::ServerId::CubeCraft, "CubeCraft", "cubecraft", "CubeCraft Games Logo" },
+        ServerPresence { ServerDetection::ServerId::Galaxite, "Galaxite", "galaxite", "Galaxite Network Logo" },
+        ServerPresence { ServerDetection::ServerId::Zeqa, "Zeqa", "zeqa", "Zeqa Practice Logo" },
+    };
+
+    const std::array<std::pair<std::string_view, std::string_view>, 14> hiveGameNames = {
+        std::pair<std::string_view, std::string_view> { "WARS", "Treasure Wars" },
+        std::pair<std::string_view, std::string_view> { "DR", "DeathRun" },
+        std::pair<std::string_view, std::string_view> { "HIDE", "Hide and Seek" },
+        std::pair<std::string_view, std::string_view> { "SG", "Survival Games" },
+        std::pair<std::string_view, std::string_view> { "MURDER", "Murder Mystery" },
+        std::pair<std::string_view, std::string_view> { "SKY", "SkyWars" },
+        std::pair<std::string_view, std::string_view> { "CTF", "Capture the Flag" },
+        std::pair<std::string_view, std::string_view> { "DROP", "Block Drop" },
+        std::pair<std::string_view, std::string_view> { "GROUND", "Ground Wars" },
+        std::pair<std::string_view, std::string_view> { "BUILD", "Build Battle" },
+        std::pair<std::string_view, std::string_view> { "PARTY", "Block Party" },
+        std::pair<std::string_view, std::string_view> { "BRIDGE", "The Bridge" },
+        std::pair<std::string_view, std::string_view> { "GRAV", "Gravity" },
+        std::pair<std::string_view, std::string_view> { "BED", "BedWars" },
+    };
+
+    const std::string discordApplicationId = "1066896173799047199";
+    const std::chrono::seconds presenceCheckInterval { 5 };
+    const std::chrono::seconds presenceRefreshInterval { 60 };
+    const std::chrono::seconds hiveConnectionRefreshDelay { 3 };
+    const std::chrono::seconds hiveConnectionResponseWindow { 20 };
+
+    void onUpdate(UpdateEvent& ev);
+    void onPacketReceive(PacketReceiveEvent& ev);
+    void onClientText(ClientTextEvent& ev);
+    void onSendPacket(SendPacketEvent& ev);
+    void updateConnectionState();
+    void publishPresence(bool force);
+    DiscordIpcClient::Activity makeActivity() const;
+
+    std::optional<DiscordIpcClient> ipcClient;
+    std::optional<DiscordIpcClient::Activity> lastSentActivity;
+    std::optional<std::string> hiveGameModeCode;
+    ServerPresence const* activeServer = nullptr;
+    std::string activeServerAddress;
+    std::chrono::steady_clock::time_point lastCheck {};
+    std::chrono::steady_clock::time_point lastRefresh {};
+    std::chrono::steady_clock::time_point connectionRefreshAt {};
+    std::chrono::steady_clock::time_point suppressConnectionResponsesUntil {};
+    std::int64_t sessionStart = 0;
+    bool sendingConnectionRequest = false;
+};

@@ -1,0 +1,57 @@
+name: Build Baritone.dll
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      BUILD_DIR: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v3
+
+      - name: Check the embedded bot script is up to date
+        shell: bash
+        run: |
+          cd baritone && sh build.sh && cd ..
+          python tools/baritone/embed_script.py
+          git diff --stat --exit-code src/client/feature/module/modules/game/baritone/BaritoneScript.cpp || echo "::warning::BaritoneScript.cpp was regenerated during the build"
+
+      - name: Compute build timestamp
+        id: ts
+        shell: bash
+        run: echo "timestamp=$(date -u +"%Y-%m-%d_%H-%M-%SZ")" >> "$GITHUB_OUTPUT"
+
+      - name: Configure (MSVC + Ninja)
+        run: |
+          cmake -B ${{ env.BUILD_DIR }} -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=cl.exe `
+            -DCMAKE_CXX_COMPILER=cl.exe `
+            -DLATITE_BUILD_TIMESTAMP=${{ steps.ts.outputs.timestamp }}
+
+      - name: Build
+        run: cmake --build ${{ env.BUILD_DIR }}
+
+      - name: Upload Baritone.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: Baritone-dll
+          path: |
+            ${{ env.BUILD_DIR }}/Baritone.dll
+            ${{ env.BUILD_DIR }}/Baritone.pdb
+          if-no-files-found: error
